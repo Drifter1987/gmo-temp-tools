@@ -1,0 +1,9 @@
+[package]
+name = "local-auth"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fs2 = "0.4"
+tiny_http = "0.12"
+rand = "0.8"

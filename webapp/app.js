@@ -1,0 +1,1374 @@
+"use strict";
+/**
+ * Browser client for GMO TempTools. It is served by the desktop process on
+ * 127.0.0.1:8780 and uses the same APIs and OTP vault as the native tabs.
+ */
+(() => {
+    const API_BASE = (window.TEMPTOOLS_API_BASE ?? "").replace(/\/+$/, "");
+    const WEB = API_BASE.length > 0;
+    const CLIENT_ID_KEY = "gmo-temptools.client.v1";
+    const LOCAL_OTP_KEY = "gmo-temptools.otp.v1";
+    const app = GmoUI.$("#app");
+    const { esc, copy, readJson, toast } = GmoUI;
+    const screens = ["mail", "sms", "otp", "settings"];
+    let current = "mail";
+    let renderToken = 0;
+    let timers = [];
+    const mail = {
+        providers: [],
+        health: [],
+        healthUnavailable: false,
+        inboxes: [],
+        selected: null,
+        messages: [],
+        detail: null,
+        provider: WEB ? "guerrilla" : "mail.tm",
+    };
+    const sms = {
+        numbers: [],
+        selected: null,
+        messages: [],
+        detail: null,
+        status: null,
+        countries: [],
+        country: "",
+        available: [],
+        chosen: "",
+    };
+    const otp = {
+        tab: "extract",
+        paste: "",
+        found: null,
+        uri: "",
+        label: "",
+        secrets: [],
+    };
+    const settingsState = {
+        appearance: "dark",
+        notifications: { enabled: true, mail: true, sms: true },
+        owner: "",
+        version: "",
+        paths: [],
+        notes: [],
+        status: "",
+    };
+    if (WEB) {
+        const mode = GmoUI.$("#mode-status");
+        if (mode)
+            mode.innerHTML = '<span class="pulse"></span> hosted web';
+        const footer = GmoUI.$("#footer-mode");
+        if (footer)
+            footer.textContent = "mail + SMS via API · otp in this browser";
+    }
+    function isScreen(value) {
+        return screens.indexOf(value) >= 0;
+    }
+    function stopTimers() {
+        timers.forEach((timer) => window.clearInterval(timer));
+        timers = [];
+    }
+    function addTimer(callback, milliseconds) {
+        timers.push(window.setInterval(callback, milliseconds));
+    }
+    function clientId() {
+        try {
+            let id = localStorage.getItem(CLIENT_ID_KEY) ?? "";
+            if (!id) {
+                id = typeof crypto.randomUUID === "function"
+                    ? crypto.randomUUID()
+                    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+                localStorage.setItem(CLIENT_ID_KEY, id);
+            }
+            return id;
+        }
+        catch {
+            return "anonymous";
+        }
+    }
+    function loadLocalSecrets() {
+        try {
+            const raw = JSON.parse(localStorage.getItem(LOCAL_OTP_KEY) ?? "[]");
+            return Array.isArray(raw)
+                ? raw.filter((item) => Boolean(item && item.secret && item.label))
+                : [];
+        }
+        catch {
+            return [];
+        }
+    }
+    function saveLocalSecrets(secrets) {
+        localStorage.setItem(LOCAL_OTP_KEY, JSON.stringify(secrets));
+    }
+    function base32Bytes(value) {
+        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        const clean = value.toUpperCase().replace(/[^A-Z2-7]/g, "");
+        let bits = 0;
+        let accumulator = 0;
+        const out = [];
+        for (const char of clean) {
+            const digit = alphabet.indexOf(char);
+            if (digit < 0)
+                continue;
+            accumulator = (accumulator << 5) | digit;
+            bits += 5;
+            if (bits >= 8) {
+                bits -= 8;
+                out.push((accumulator >>> bits) & 0xff);
+            }
+        }
+        return new Uint8Array(out);
+    }
+    function parseOtpSecret(input, label) {
+        const raw = input.trim();
+        let secret = raw;
+        let resolvedLabel = label.trim() || "Authenticator";
+        let digits = 6;
+        let period = 30;
+        let algorithm = "SHA1";
+        if (raw.toLowerCase().startsWith("otpauth://")) {
+            try {
+                const parsed = new URL(raw);
+                if (parsed.hostname.toLowerCase() !== "totp")
+                    return null;
+                secret = parsed.searchParams.get("secret") ?? "";
+                digits = Number(parsed.searchParams.get("digits") ?? "6");
+                period = Number(parsed.searchParams.get("period") ?? "30");
+                const algorithmName = (parsed.searchParams.get("algorithm") ?? "SHA1").toUpperCase();
+                if (algorithmName === "SHA256" || algorithmName === "SHA512")
+                    algorithm = algorithmName;
+                resolvedLabel = label.trim() || decodeURIComponent(parsed.pathname.replace(/^\/+/, "")) || "Authenticator";
+            }
+            catch {
+                return null;
+            }
+        }
+        secret = secret.replace(/[\s-]/g, "").toUpperCase();
+        if (!/^[A-Z2-7]+=*$/.test(secret) || secret.replace(/=/g, "").length < 8)
+            return null;
+        if (digits !== 6 && digits !== 8)
+            return null;
+        if (!Number.isFinite(period) || period < 15 || period > 120)
+            return null;
+        return { label: resolvedLabel, secret, digits, period, algorithm };
+    }
+    function maskSecret(secret) {
+        return `${secret.slice(0, 4)}…${secret.slice(-4)}`;
+    }
+    async function totpCode(secret) {
+        const rawSecret = base32Bytes(secret.secret);
+        const key = await crypto.subtle.importKey("raw", rawSecret.buffer, { name: "HMAC", hash: `SHA-${secret.algorithm === "SHA512" ? "512" : secret.algorithm === "SHA256" ? "256" : "1"}` }, false, ["sign"]);
+        const counter = new Uint8Array(8);
+        let value = Math.floor(Date.now() / 1000 / secret.period);
+        for (let index = 7; index >= 0; index -= 1) {
+            counter[index] = value & 0xff;
+            value = Math.floor(value / 256);
+        }
+        const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, counter));
+        const offset = signature[signature.length - 1] & 0x0f;
+        const binary = ((signature[offset] & 0x7f) << 24) |
+            ((signature[offset + 1] & 0xff) << 16) |
+            ((signature[offset + 2] & 0xff) << 8) |
+            (signature[offset + 3] & 0xff);
+        return String(binary % 10 ** secret.digits).padStart(secret.digits, "0");
+    }
+    async function localOtpPayload() {
+        const now = Date.now() / 1000;
+        const secrets = loadLocalSecrets();
+        return {
+            secrets: await Promise.all(secrets.map(async (secret, index) => ({
+                index,
+                label: secret.label,
+                masked: maskSecret(secret.secret),
+                code: await totpCode(secret),
+                digits: secret.digits,
+                period: secret.period,
+                algorithm: secret.algorithm,
+                remaining: Math.max(0, Math.ceil(secret.period - (now % secret.period))),
+            }))),
+        };
+    }
+    function extractFromText(input) {
+        const codes = [];
+        const patterns = [
+            /(?:code|otp|pin|passcode|verification)[^0-9]{0,24}(\d{4,8})/gi,
+            /(\d{4,8})[^0-9]{0,24}(?:code|otp|pin|verification)/gi,
+            /\b(\d{4,8})\b/g,
+        ];
+        for (const pattern of patterns) {
+            for (const match of input.matchAll(pattern)) {
+                const code = match[1];
+                if (code && codes.indexOf(code) < 0)
+                    codes.push(code);
+                if (codes.length >= 6)
+                    break;
+            }
+            if (codes.length >= 6)
+                break;
+        }
+        const links = Array.from(input.matchAll(/https?:\/\/[^\s<>"']+/gi), (match) => match[0].replace(/[),.;]+$/, "")).slice(0, 6);
+        return { codes, links };
+    }
+    async function localOtpRequest(url, init) {
+        const method = (init?.method ?? "GET").toUpperCase();
+        const path = url.split("?")[0];
+        if (method === "GET" && path === "/api/otp") {
+            return (await localOtpPayload());
+        }
+        if (method === "POST" && path === "/api/otp/extract") {
+            const body = JSON.parse(String(init?.body ?? "{}"));
+            return extractFromText(body.text ?? "");
+        }
+        if (method === "POST" && path === "/api/otp") {
+            const body = JSON.parse(String(init?.body ?? "{}"));
+            const parsed = parseOtpSecret(body.input ?? "", body.label ?? "");
+            if (!parsed)
+                throw new Error("That is not an otpauth:// URI or a base32 secret (8+ characters).");
+            const secrets = loadLocalSecrets();
+            const exists = secrets.some((item) => item.secret === parsed.secret && item.label === parsed.label);
+            if (!exists) {
+                secrets.push(parsed);
+                saveLocalSecrets(secrets);
+            }
+            return { ok: true, added: !exists };
+        }
+        if (method === "DELETE" && path.startsWith("/api/otp/")) {
+            const index = Number(path.slice("/api/otp/".length));
+            const secrets = loadLocalSecrets();
+            if (!Number.isInteger(index) || index < 0 || index >= secrets.length) {
+                throw new Error("Secret not found");
+            }
+            secrets.splice(index, 1);
+            saveLocalSecrets(secrets);
+            return { ok: true };
+        }
+        throw new Error("Unsupported local OTP request");
+    }
+    async function api(url, init) {
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (WEB && url.split("?")[0].startsWith("/api/otp")) {
+            return localOtpRequest(url, init);
+        }
+        const headers = new Headers(init?.headers);
+        if (method !== "GET" && method !== "HEAD") {
+            headers.set("X-TempTools-CSRF", "1");
+        }
+        if (WEB)
+            headers.set("X-TempTools-Client", clientId());
+        const response = await fetch(`${API_BASE}${url}`, {
+            cache: "no-store",
+            credentials: WEB ? "omit" : "same-origin",
+            ...(init ?? {}),
+            headers,
+        });
+        const data = await readJson(response);
+        if (!response.ok) {
+            throw new Error(data?.error ?? `Request failed (${response.status})`);
+        }
+        return data;
+    }
+    function fail(error) {
+        toast(error instanceof Error ? error.message : String(error), 3500);
+    }
+    function ttl(expires) {
+        return GmoUI.ttl(expires - Date.now());
+    }
+    function updateTtls() {
+        GmoUI.updateTtls((remaining) => GmoUI.ttl(remaining));
+    }
+    function ttlSpan(expires) {
+        return `<span data-ttl data-expires="${expires}">${esc(ttl(expires))}</span>`;
+    }
+    function show(screen) {
+        current = screen;
+        renderToken += 1;
+        stopTimers();
+        document.querySelectorAll("#main-tabs .main-tab").forEach((button) => {
+            button.classList.toggle("on", button.dataset.screen === screen);
+        });
+        history.replaceState(null, "", `#${screen}`);
+        app.innerHTML = `<p class="muted pad">Loading…</p>`;
+        if (screen === "mail")
+            void renderMail();
+        if (screen === "sms")
+            void renderSms();
+        if (screen === "otp")
+            void renderOtp();
+        if (screen === "settings")
+            renderSettings();
+    }
+    // ---------------------------------------------------------------- mail
+    function mailShell() {
+        return `
+      <section class="intro">
+        <div>
+          <h1>Mail</h1>
+          <p class="muted">Throwaway addresses and verification codes, ${WEB ? "kept in this browser's hosted session." : "kept locally."}</p>
+        </div>
+        <div class="intro-actions">
+          <span class="chip live">live mail</span>
+          <select class="select" id="mail-provider" aria-label="Mail provider"></select>
+          <button class="btn primary" data-action="mail-new">New inbox</button>
+        </div>
+      </section>
+      <p class="note">Each inbox is fetched from the provider you chose when creating it and kept ${WEB ? "by the hosted API" : "locally"} for one hour.</p>
+      <p class="muted small" id="mail-provider-note"></p>
+      <p class="muted small" id="mail-health"></p>
+      <div class="split">
+        <div class="split-list" id="mail-list"><div class="pad muted">No inboxes loaded.</div></div>
+        <div class="split-main" id="mail-thread">
+          <div class="empty-reading"><p class="muted">Select a message to read it.</p></div>
+        </div>
+      </div>
+      <details class="guide">
+        <summary>How it works</summary>
+        <ol>
+          <li>Create an inbox and paste the address into a signup form.</li>
+          <li>The verification mail arrives here; the code is pulled out automatically.</li>
+          <li>Inboxes and their mail are deleted an hour after creation.</li>
+          <li>Some senders block disposable domains; switching provider is the practical workaround.</li>
+        </ol>
+        <p>No account is needed here. The message list is cached for a few seconds to stay inside provider free-tier limits.</p>
+      </details>`;
+    }
+    function renderMail() {
+        const token = ++renderToken;
+        app.innerHTML = mailShell();
+        void loadMail(token);
+        addTimer(() => {
+            if (current === "mail" && document.visibilityState === "visible") {
+                void loadMailMessages();
+            }
+        }, 4000);
+        addTimer(() => {
+            if (current === "mail" && document.visibilityState === "visible") {
+                void loadMail(renderToken);
+            }
+        }, 20000);
+    }
+    async function loadMail(token, fresh = false) {
+        try {
+            const inboxes = fresh ? "/api/mail/api/inboxes?fresh=1" : "/api/mail/api/inboxes";
+            const [status, list, acceptance] = await Promise.all([
+                api("/api/mail/api/status"),
+                api(inboxes),
+                api("/api/mail/api/acceptance").catch(() => null),
+            ]);
+            if (token !== renderToken || current !== "mail")
+                return;
+            mail.providers = status.providers ?? [];
+            mail.healthUnavailable = !acceptance?.provider_health;
+            if (acceptance?.provider_health)
+                mail.health = acceptance.provider_health;
+            mail.inboxes = list.inboxes ?? [];
+            if (mail.selected && !mail.inboxes.some((inbox) => inbox.id === mail.selected)) {
+                mail.selected = null;
+                mail.detail = null;
+                mail.messages = [];
+            }
+            paintMail();
+            // A fresh inbox pass already refreshed the provider cache for every
+            // inbox. Fetch from that cache rather than spending a second provider
+            // request for the selected mailbox.
+            if (mail.selected)
+                void loadMailMessages();
+        }
+        catch (error) {
+            if (token === renderToken && current === "mail") {
+                app.innerHTML = `<div class="empty"><h2>Mail is unavailable</h2><p>${esc(String(error))}</p></div>`;
+            }
+        }
+    }
+    function paintMail() {
+        const picker = GmoUI.$("#mail-provider");
+        if (picker) {
+            const options = mail.providers
+                .map((provider) => `<option value="${esc(provider.id)}"${mail.provider === provider.id ? " selected" : ""}>${esc(provider.label)}</option>`)
+                .join("");
+            if (picker.innerHTML !== options)
+                picker.innerHTML = options;
+        }
+        const selected = mail.providers.find((provider) => provider.id === mail.provider);
+        const rule = GmoUI.$("#mail-provider-note");
+        if (rule) {
+            rule.textContent = selected?.address_rule ? `Address rule: ${selected.address_rule}` : "";
+        }
+        const health = GmoUI.$("#mail-health");
+        if (health) {
+            const current = mail.health.filter((row) => row.error_is_current && row.last_error);
+            const history = mail.health.filter((row) => row.create_failures > 0 || row.list_failures > 0);
+            if (mail.healthUnavailable) {
+                health.textContent = "Provider health is unavailable right now. Other Mail data may be stale.";
+            }
+            else if (current.length > 0) {
+                health.textContent = `Provider issue now: ${current.map((row) => `${row.provider} — ${row.last_error}`).join(" · ")}`;
+            }
+            else if (history.length > 0) {
+                const lastSuccess = history
+                    .map((row) => row.last_success_at)
+                    .filter((value) => value > 0)
+                    .sort((a, b) => b - a)[0];
+                health.textContent = `Providers responding · ${history.map((row) => `${row.provider}: ${row.create_failures} create / ${row.list_failures} list failures`).join(" · ")}${lastSuccess ? ` · last success ${new Date(lastSuccess).toLocaleTimeString()}` : ""}`;
+            }
+            else {
+                health.textContent = "Provider health: no failures recorded yet.";
+            }
+        }
+        const list = GmoUI.$("#mail-list");
+        if (list) {
+            if (mail.inboxes.length === 0) {
+                list.innerHTML = '<div class="pad muted">No inboxes yet. Use “New inbox”.</div>';
+            }
+            else {
+                list.innerHTML = mail.inboxes
+                    .map((inbox) => {
+                    const last = inbox.last;
+                    const pill = inbox.unread > 0 ? `<span class="pill">${inbox.unread}</span>` : "";
+                    return `<button class="item ${mail.selected === inbox.id ? "on" : ""}" data-action="mail-select" data-id="${esc(inbox.id)}">
+              <div class="item-top"><span class="item-who mono">${esc(inbox.address)}</span>${pill}</div>
+              <div class="item-title">${esc(last?.subject || "Waiting for the first message")}</div>
+              <div class="item-snips">${esc(last?.sender || inbox.provider)} · ${ttlSpan(inbox.expires_at)}</div>
+            </button>`;
+                })
+                    .join("");
+            }
+        }
+        paintMailThread();
+        updateTtls();
+    }
+    function paintMailThread() {
+        const thread = GmoUI.$("#mail-thread");
+        if (!thread)
+            return;
+        if (!mail.selected) {
+            thread.innerHTML = '<div class="empty-reading"><p class="muted">Select an inbox, then a message.</p></div>';
+            return;
+        }
+        const inbox = mail.inboxes.find((item) => item.id === mail.selected);
+        if (!inbox) {
+            thread.innerHTML = '<div class="empty-reading"><p class="muted">That inbox is gone.</p></div>';
+            return;
+        }
+        const list = mail.messages.length === 0
+            ? '<div class="pad muted">No messages yet. Refresh or wait for mail.</div>'
+            : mail.messages
+                .map((message) => `<button class="item ${mail.detail?.id === message.id ? "on" : ""} ${message.seen ? "" : "unread"}" data-action="mail-open" data-id="${esc(message.id)}">
+              <div class="item-top"><span class="item-who">${esc(message.sender)}</span><span class="item-when">${esc(GmoUI.messageTime(message.received_at))}</span></div>
+              <div class="item-title">${esc(message.subject || "(no subject)")}</div>
+              <div class="item-snips">${esc(message.preview || "")}</div>
+            </button>`)
+                .join("");
+        const detail = mail.detail && mail.detail.id && mail.messages.some((m) => m.id === mail.detail?.id)
+            ? renderMailDetail(mail.detail)
+            : '<div class="empty-reading"><p class="muted">Select a message to read it.</p></div>';
+        thread.innerHTML = `
+      <div class="row-between">
+        <div>
+          <span class="label">inbox</span>
+          <div class="mono">${esc(inbox.address)}</div>
+        </div>
+        <div class="row">
+          <button class="btn small" data-copy="${esc(inbox.address)}">Copy</button>
+          <button class="btn small" data-action="mail-refresh">Refresh</button>
+          <button class="btn small danger" data-action="mail-delete" data-id="${esc(inbox.id)}">Delete</button>
+        </div>
+      </div>
+      <div class="row" style="margin:10px 0 14px"><span class="chip live">${esc(inbox.provider)}</span><span class="ttl">${ttlSpan(inbox.expires_at)}</span></div>
+      <div class="split" style="border:0;min-height:0">
+        <div class="split-list" style="border-right:1px solid var(--line);max-height:320px">${list}</div>
+        <div style="padding:18px;overflow:auto;max-height:320px">${detail}</div>
+      </div>`;
+        updateTtls();
+    }
+    function renderMailDetail(detail) {
+        const code = detail.code
+            ? `<div class="code-box"><div><div class="label">verification code</div><div class="value">${esc(detail.code)}</div></div><button class="btn" data-copy="${esc(detail.code)}">Copy code</button></div>`
+            : "";
+        const link = detail.link
+            ? `<p><a href="${esc(detail.link)}" target="_blank" rel="noreferrer noopener">Open verification link</a> <button class="btn small" data-copy="${esc(detail.link)}">Copy link</button></p>`
+            : "";
+        const htmlUrl = `${API_BASE}/api/mail/api/messages/${encodeURIComponent(detail.id)}/html${WEB ? `?client=${encodeURIComponent(clientId())}` : ""}`;
+        const html = detail.has_html
+            ? `<details><summary class="muted small">HTML view</summary><iframe class="html-frame" sandbox title="Message HTML" src="${htmlUrl}"></iframe></details>`
+            : "";
+        return `<div class="read-head"><h2>${esc(detail.subject || "(no subject)")}</h2><div class="read-meta"><span>${esc(detail.sender)}</span><span>·</span><span>${esc(new Date(detail.received_at).toLocaleString())}</span></div></div>
+      ${code}${link}<div class="body-text">${esc(detail.text || "")}</div>${html}`;
+    }
+    async function loadMailMessages(fresh = false) {
+        const id = mail.selected;
+        if (!id)
+            return;
+        try {
+            const path = `/api/mail/api/inboxes/${encodeURIComponent(id)}/messages${fresh ? "?fresh=1" : ""}`;
+            const data = await api(path);
+            if (current !== "mail" || mail.selected !== id)
+                return;
+            mail.messages = data.messages ?? [];
+            if (mail.detail && !mail.messages.some((message) => message.id === mail.detail?.id)) {
+                mail.detail = null;
+            }
+            paintMailThread();
+        }
+        catch (error) {
+            fail(error);
+        }
+    }
+    async function openMailMessage(id) {
+        try {
+            const detail = await api(`/api/mail/api/messages/${encodeURIComponent(id)}`);
+            if (current !== "mail")
+                return;
+            const opened = mail.messages.find((message) => message.id === id);
+            if (opened && !opened.seen) {
+                opened.seen = true;
+                const inbox = mail.inboxes.find((item) => item.id === mail.selected);
+                if (inbox)
+                    inbox.unread = Math.max(0, inbox.unread - 1);
+                paintMail();
+            }
+            mail.detail = detail;
+            paintMailThread();
+        }
+        catch (error) {
+            fail(error);
+        }
+    }
+    async function createInbox(button) {
+        const picker = GmoUI.$("#mail-provider");
+        mail.provider = picker?.value || mail.provider;
+        button.setAttribute("aria-busy", "true");
+        button.disabled = true;
+        try {
+            const created = await api("/api/mail/api/inboxes", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ provider: mail.provider }),
+            });
+            if (!created.id)
+                throw new Error("The provider did not return an inbox");
+            if (created.fallback) {
+                toast(`Fell back from ${created.requested_provider ?? mail.provider} to ${created.provider ?? "another provider"}.`);
+            }
+            mail.selected = created.id;
+            await loadMail(renderToken);
+        }
+        catch (error) {
+            fail(error);
+        }
+        finally {
+            button.disabled = false;
+            button.removeAttribute("aria-busy");
+        }
+    }
+    // ---------------------------------------------------------------- sms
+    function countryLabel(slug) {
+        return slug.split("-").filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+    }
+    function numberLabel(digits) {
+        return digits.startsWith("+") ? digits : `+${digits}`;
+    }
+    function preferSmsHealth(next) {
+        if (!next || !sms.status)
+            return;
+        const current = sms.status.source_health;
+        // The status endpoint and the country endpoint can race. Keep the newer
+        // attempt, or adopt the country result when status has nothing yet.
+        if (!current || current.status === "unknown" || (next.last_attempt_at ?? 0) > (current.last_attempt_at ?? 0)) {
+            sms.status.source_health = next;
+        }
+    }
+    function renderSms() {
+        const token = ++renderToken;
+        app.innerHTML = `
+      <section class="intro">
+        <div><h1>SMS <span class="chip demo">Beta</span></h1><p class="muted">Browse a country's public numbers, then read their texts and codes.</p></div>
+        <div class="intro-actions"><span class="chip live" id="sms-live">receive-sms.io</span></div>
+      </section>
+      <p class="note">Beta: these are public shared inboxes. Anyone who opens the same page sees the same texts, and upstream availability changes without notice. Pick a country first, then a listed number.</p>
+      <form class="panel panel-form" id="sms-picker">
+        <div class="panel-row"><label for="sms-country">Country</label><select class="select" id="sms-country"></select></div>
+        <div class="panel-row"><label for="sms-number">Public number</label><select class="select" id="sms-number"></select></div>
+        <div class="panel-row"><span></span><span class="row"><button class="btn" type="button" data-action="sms-check">Check source</button><button class="btn primary" type="submit">Add selected number</button></span></div>
+      </form>
+      <p class="muted small" id="sms-source">Checking receive-sms.io…</p>
+      <div class="split">
+        <div class="split-list" id="sms-list"><div class="pad muted">No numbers loaded.</div></div>
+        <div class="split-main" id="sms-thread"><div class="empty-reading"><p class="muted">Select a number to read its texts.</p></div></div>
+      </div>
+      ${WEB ? "" : "<div id=\"sms-webhook\"></div>"}
+      <details class="guide"><summary>Webhook and limits</summary>
+        <p>Signed inbound texts: <code>POST /api/inbound/sms</code> on port 8782. Twilio uses <code>TWILIO_AUTH_TOKEN</code>, Telnyx uses <code>TELNYX_PUBLIC_KEY</code>, and anything else needs <code>WEBHOOK_SECRET</code>. An unset contract answers 503.</p>
+        <p>A carrier retry is matched by its message id. A generic payload without an id is stored again on retry.</p>
+      </details>`;
+        void loadSms(token);
+    }
+    async function loadSms(token) {
+        try {
+            const [status, list, catalog] = await Promise.all([
+                api("/api/sms/api/status"),
+                api("/api/sms/api/numbers"),
+                api("/api/sms/api/countries").catch(() => null),
+            ]);
+            if (token !== renderToken || current !== "sms")
+                return;
+            sms.status = status;
+            sms.numbers = list.numbers ?? [];
+            if (catalog?.countries)
+                sms.countries = catalog.countries;
+            preferSmsHealth(catalog?.source_health);
+            if (!sms.country || sms.countries.indexOf(sms.country) < 0) {
+                sms.country = sms.countries[0] ?? "";
+            }
+            if (sms.selected && !sms.numbers.some((number) => number.id === sms.selected)) {
+                sms.selected = null;
+                sms.messages = [];
+                sms.detail = null;
+            }
+            paintSms();
+            if (sms.country && sms.available.length === 0)
+                void loadSmsNumbers();
+            if (sms.selected)
+                void loadSmsMessages();
+        }
+        catch (error) {
+            if (token === renderToken && current === "sms") {
+                app.innerHTML = `<div class="empty"><h2>SMS is unavailable</h2><p>${esc(String(error))}</p></div>`;
+            }
+        }
+    }
+    async function loadSmsNumbers() {
+        const country = sms.country;
+        if (!country)
+            return;
+        sms.available = [];
+        sms.chosen = "";
+        paintSmsPicker();
+        try {
+            const data = await api(`/api/sms/api/countries/${encodeURIComponent(country)}/numbers`);
+            if (current !== "sms" || sms.country !== country)
+                return;
+            sms.available = data.numbers ?? [];
+            if (sms.available.indexOf(sms.chosen) < 0)
+                sms.chosen = sms.available[0] ?? "";
+            preferSmsHealth(data.source_health);
+            paintSms();
+        }
+        catch (error) {
+            if (current === "sms" && sms.country === country) {
+                sms.available = [];
+                sms.chosen = "";
+                await refreshSmsHealth();
+                paintSms();
+                fail(error);
+            }
+        }
+    }
+    async function refreshSmsHealth() {
+        try {
+            const data = await api("/api/sms/api/health");
+            if (current === "sms" && data.source && sms.status) {
+                sms.status.source_health = data.source;
+            }
+        }
+        catch {
+            // The original source error is the useful message; do not replace it.
+        }
+    }
+    async function checkSmsSource() {
+        try {
+            const data = await api("/api/sms/api/source/check", { method: "POST" });
+            if (current !== "sms")
+                return;
+            sms.countries = data.countries ?? sms.countries;
+            preferSmsHealth(data.source_health);
+            if (!sms.country || sms.countries.indexOf(sms.country) < 0)
+                sms.country = sms.countries[0] ?? "";
+            paintSms();
+            await loadSmsNumbers();
+            toast(`Source ${data.source_health?.status ?? "checked"} · ${sms.countries.length} countries`);
+        }
+        catch (error) {
+            await refreshSmsHealth();
+            paintSms();
+            fail(error);
+        }
+    }
+    function paintSms() {
+        const badge = GmoUI.$("#sms-live");
+        if (badge && sms.status?.source_health) {
+            const source = sms.status.source_health;
+            badge.textContent = `receive-sms.io · ${source.status}`;
+            badge.className = `chip ${source.status === "ok" ? "live" : "demo"}`;
+            badge.title = source.last_error || sms.status.provider_rule || "";
+        }
+        const source = GmoUI.$("#sms-source");
+        if (source) {
+            const health = sms.status?.source_health;
+            if (!health) {
+                source.textContent = "Source status not loaded yet.";
+            }
+            else if (health.last_source === "cache") {
+                source.textContent = `Last good country list is being shown · ${health.last_error || "source unavailable"}`;
+            }
+            else if (health.last_error) {
+                source.textContent = `Source ${health.status} · ${health.last_error}`;
+            }
+            else {
+                source.textContent = `Source ${health.status} · ${sms.countries.length} countries listed · public numbers are shared inboxes.`;
+            }
+        }
+        const list = GmoUI.$("#sms-list");
+        if (list) {
+            list.innerHTML = sms.numbers.length === 0
+                ? '<div class="pad muted">No numbers saved yet. Pick one above.</div>'
+                : sms.numbers
+                    .map((number) => `<button class="item ${sms.selected === number.id ? "on" : ""}" data-action="sms-select" data-id="${esc(number.id)}">
+                <div class="item-top"><span class="item-who mono">${esc(number.e164)}</span></div>
+                <div class="item-title">${esc(countryLabel(number.country))} · ${esc(number.provider)}</div>
+                <div class="item-snips">Beta · public shared inbox · expires ${ttlSpan(number.expires_at)}</div>
+              </button>`)
+                    .join("");
+        }
+        paintSmsPicker();
+        paintSmsThread();
+        paintWebhook("#sms-webhook", sms.status);
+        updateTtls();
+    }
+    function paintSmsPicker() {
+        const country = GmoUI.$("#sms-country");
+        if (country) {
+            country.innerHTML = sms.countries.length === 0
+                ? '<option value="">No countries listed</option>'
+                : sms.countries.map((slug) => `<option value="${esc(slug)}"${slug === sms.country ? " selected" : ""}>${esc(countryLabel(slug))}</option>`).join("");
+            country.value = sms.country;
+        }
+        const number = GmoUI.$("#sms-number");
+        if (number) {
+            number.innerHTML = sms.available.length === 0
+                ? '<option value="">No numbers listed</option>'
+                : sms.available.map((digits) => `<option value="${esc(digits)}"${digits === sms.chosen ? " selected" : ""}>${esc(numberLabel(digits))}</option>`).join("");
+            number.value = sms.chosen;
+        }
+    }
+    function paintSmsThread() {
+        const thread = GmoUI.$("#sms-thread");
+        if (!thread)
+            return;
+        if (!sms.selected) {
+            thread.innerHTML = '<div class="empty-reading"><p class="muted">Select a number, then a text.</p></div>';
+            return;
+        }
+        const number = sms.numbers.find((item) => item.id === sms.selected);
+        if (!number) {
+            thread.innerHTML = '<div class="empty-reading"><p class="muted">That number is gone.</p></div>';
+            return;
+        }
+        const list = sms.messages.length === 0
+            ? '<div class="pad muted">No texts yet. Refresh or wait for a delivery.</div>'
+            : sms.messages
+                .map((message) => `<button class="item ${sms.detail?.id === message.id ? "on" : ""} ${message.seen ? "" : "unread"}" data-action="sms-open" data-id="${esc(message.id)}">
+              <div class="item-top"><span class="item-who">${esc(message.sender)}</span><span class="item-when">${esc(GmoUI.messageTime(message.received_at))}</span></div>
+              <div class="item-snips">${esc(message.preview || message.body || "")}</div>
+            </button>`)
+                .join("");
+        const detail = sms.detail && sms.messages.some((m) => m.id === sms.detail?.id)
+            ? renderSmsDetail(sms.detail)
+            : '<div class="empty-reading"><p class="muted">Select a text to read it.</p></div>';
+        thread.innerHTML = `
+      <div class="row-between"><div><span class="label">number</span><div class="mono">${esc(number.e164)}</div></div>
+        <div class="row"><button class="btn small" data-copy="${esc(number.e164)}">Copy</button><button class="btn small" data-action="sms-refresh">Refresh</button><button class="btn small danger" data-action="sms-delete" data-id="${esc(number.id)}">Delete</button></div>
+      </div>
+      <div class="row" style="margin:10px 0 14px"><span class="chip live">${esc(number.provider)}</span><span class="ttl">${ttlSpan(number.expires_at)}</span></div>
+      <div class="split" style="border:0;min-height:0">
+        <div class="split-list" style="border-right:1px solid var(--line);max-height:320px">${list}</div>
+        <div style="padding:18px;overflow:auto;max-height:320px">${detail}</div>
+      </div>`;
+        updateTtls();
+    }
+    function renderSmsDetail(detail) {
+        const code = detail.code
+            ? `<div class="code-box"><div><div class="label">code found</div><div class="value">${esc(detail.code)}</div></div><button class="btn" data-copy="${esc(detail.code)}">Copy code</button></div>`
+            : "";
+        return `<div class="bubble-meta"><span>${esc(detail.sender)}</span><span>·</span><span>${esc(new Date(detail.received_at).toLocaleString())}</span></div>${code}<div class="bubble">${esc(detail.body || "")}</div>`;
+    }
+    async function loadSmsMessages(fresh = false) {
+        const id = sms.selected;
+        if (!id)
+            return;
+        try {
+            const data = await api(`/api/sms/api/numbers/${encodeURIComponent(id)}/messages${fresh ? "?fresh=1" : ""}`);
+            if (current !== "sms" || sms.selected !== id)
+                return;
+            sms.messages = data.messages ?? [];
+            if (sms.detail && !sms.messages.some((message) => message.id === sms.detail?.id))
+                sms.detail = null;
+            paintSmsThread();
+        }
+        catch (error) {
+            fail(error);
+        }
+    }
+    async function openSmsMessage(id) {
+        try {
+            const detail = await api(`/api/sms/api/messages/${encodeURIComponent(id)}`);
+            if (current !== "sms")
+                return;
+            sms.detail = detail;
+            paintSmsThread();
+        }
+        catch (error) {
+            fail(error);
+        }
+    }
+    async function addSmsNumber(form) {
+        const country = GmoUI.$("#sms-country", form);
+        const number = GmoUI.$("#sms-number", form);
+        const button = GmoUI.$("button[type=submit]", form);
+        if (!country || !number || !button)
+            return;
+        sms.country = country.value;
+        sms.chosen = number.value;
+        if (!sms.country || !sms.chosen) {
+            toast("Choose a country and a listed public number first.");
+            return;
+        }
+        button.disabled = true;
+        try {
+            const created = await api("/api/sms/api/numbers", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ country: sms.country, number: sms.chosen }),
+            });
+            if (created.id)
+                sms.selected = created.id;
+            await loadSms(renderToken);
+            void loadSmsMessages(true);
+        }
+        catch (error) {
+            fail(error);
+        }
+        finally {
+            button.disabled = false;
+        }
+    }
+    function paintWebhook(selector, status) {
+        if (WEB)
+            return;
+        const holder = GmoUI.$(selector);
+        if (!holder)
+            return;
+        const hook = status?.webhook;
+        if (!hook) {
+            holder.innerHTML = "";
+            return;
+        }
+        const mark = (ready) => ready ? '<span class="chip live">configured</span>' : '<span class="chip demo">not set</span>';
+        const ready = status?.webhook_configured ?? (hook.twilio || hook.telnyx || hook.generic);
+        holder.innerHTML = `<div class="panel"><div class="row-between"><strong>Webhook contracts</strong><span class="muted small">${ready ? "ready" : "configure a contract before exposing the endpoint"}</span></div>
+      <div class="panel-row"><span>Twilio</span><span>${mark(hook.twilio)} <code>TWILIO_AUTH_TOKEN</code></span></div>
+      <div class="panel-row"><span>Telnyx</span><span>${mark(hook.telnyx)} <code>TELNYX_PUBLIC_KEY</code></span></div>
+      <div class="panel-row"><span>Generic</span><span>${mark(hook.generic)} <code>WEBHOOK_SECRET</code></span></div>
+    </div>`;
+    }
+    // ---------------------------------------------------------------- otp
+    function renderOtp() {
+        const token = ++renderToken;
+        app.innerHTML = `
+      <section class="intro">
+        <div><h1>OTP</h1><p class="muted">Read a code out of pasted text, or generate authenticator codes.</p></div>
+        <div class="intro-actions"><span class="chip live">offline core</span></div>
+      </section>
+      <p class="note">The extraction and TOTP engine runs in this browser. ${WEB ? "Authenticator secrets are stored only in this browser's localStorage; they are never sent to the web API." : "Authenticator secrets live in <code>temp-otp/state/vault.json</code> and are shared with the desktop tab."}</p>
+      <div class="otp-tabs">
+        <button class="otp-tab ${otp.tab === "extract" ? "on" : ""}" data-action="otp-tab" data-tab="extract">Read a code</button>
+        <button class="otp-tab ${otp.tab === "generate" ? "on" : ""}" data-action="otp-tab" data-tab="generate">Authenticator</button>
+      </div>
+      <div id="otp-body"></div>
+              <details class="guide"><summary>Security model</summary><p>${WEB ? "Secrets never leave this browser. They are stored in localStorage without the desktop app's DPAPI encryption, so use this browser profile carefully and keep another copy of any 2FA secret you cannot afford to lose." : "Secrets never leave this machine. On Windows the vault is encrypted at rest with DPAPI for your Windows user and writes are serialized with the desktop tab. Do not use this as your only copy of an account's 2FA secret."}</p></details>`;
+        if (otp.tab === "extract") {
+            paintOtpExtract();
+            void loadOtp(token);
+        }
+        else {
+            paintOtpGenerate();
+            void loadOtp(token);
+            addTimer(() => void loadOtp(renderToken), 1000);
+        }
+    }
+    function paintOtpExtract() {
+        const body = GmoUI.$("#otp-body");
+        if (!body)
+            return;
+        body.innerHTML = `<div class="panel">
+      <label class="label" for="otp-text">Paste a verification email or text</label>
+      <textarea class="textarea" id="otp-text" placeholder="Your verification code is 481920…">${esc(otp.paste)}</textarea>
+      <div class="row" style="margin-top:10px"><button class="btn primary" data-action="otp-extract">Find codes</button><button class="btn" data-action="otp-clear">Clear</button><span class="muted small">Codes near words like code, OTP or verification are ranked first.</span></div>
+    </div>
+    <div id="otp-found">${renderFound()}</div>`;
+    }
+    function paintOtpGenerate() {
+        const body = GmoUI.$("#otp-body");
+        if (!body)
+            return;
+        body.innerHTML = `<form class="panel panel-form" id="otp-add">
+      <div class="panel-row"><label for="otp-uri">otpauth:// URI or base32 secret</label><input class="input" id="otp-uri" value="${esc(otp.uri)}" placeholder="otpauth://totp/… or JBSWY3DPEHPK3PXP"></div>
+      <div class="panel-row"><label for="otp-label">Label (optional)</label><input class="input" id="otp-label" value="${esc(otp.label)}" placeholder="Work account"></div>
+      <div class="panel-row"><span></span><button class="btn primary" type="submit">Add account</button></div>
+    </form>
+    <div id="otp-secrets"></div>`;
+        paintOtpSecrets();
+    }
+    function renderFound() {
+        if (!otp.found || (otp.found.codes.length === 0 && otp.found.links.length === 0)) {
+            return '<div class="empty"><p>Paste some text and press “Find codes”.</p></div>';
+        }
+        const codes = otp.found.codes
+            .map((code) => `<div class="code-box found"><div><div class="label">candidate code</div><div class="value">${esc(code)}</div></div><button class="btn" data-copy="${esc(code)}">Copy</button></div>`)
+            .join("");
+        const links = otp.found.links
+            .map((link) => `<p><a href="${esc(link)}" target="_blank" rel="noreferrer noopener">${esc(link)}</a> <button class="btn small" data-copy="${esc(link)}">Copy</button></p>`)
+            .join("");
+        return `${codes}${links}`;
+    }
+    function paintFound() {
+        const holder = GmoUI.$("#otp-found");
+        if (holder)
+            holder.innerHTML = renderFound();
+    }
+    function paintOtpSecrets() {
+        const holder = GmoUI.$("#otp-secrets");
+        if (!holder)
+            return;
+        holder.innerHTML = otp.secrets.length === 0
+            ? '<div class="empty"><p>No authenticator accounts yet.</p></div>'
+            : otp.secrets
+                .map((secret) => {
+                const pct = Math.max(0, Math.min(100, (secret.remaining / Math.max(1, secret.period)) * 100));
+                return `<div class="secret"><div class="row-between">
+              <div><div><strong>${esc(secret.label)}</strong></div><div class="muted small">${esc(secret.algorithm)} · ${secret.digits} digits · ${secret.period}s · ${esc(secret.masked)}</div></div>
+              <div class="row"><span class="secret-code">${esc(secret.code)}</span><button class="btn small" data-copy="${esc(secret.code)}">Copy</button><button class="btn small danger" data-action="otp-remove" data-index="${secret.index}">Remove</button></div>
+            </div><div class="progress"><span style="width:${pct}%"></span></div><div class="muted small" style="margin-top:4px">${secret.remaining}s left</div></div>`;
+            })
+                .join("");
+    }
+    async function loadOtp(token) {
+        try {
+            const data = await api("/api/otp");
+            if (token !== renderToken || current !== "otp")
+                return;
+            otp.secrets = data.secrets ?? [];
+            paintOtpSecrets();
+        }
+        catch (error) {
+            fail(error);
+        }
+    }
+    async function extractOtp() {
+        const text = GmoUI.$("#otp-text")?.value ?? otp.paste;
+        otp.paste = text;
+        try {
+            otp.found = await api("/api/otp/extract", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text }),
+            });
+            paintFound();
+        }
+        catch (error) {
+            fail(error);
+        }
+    }
+    async function addOtp(form) {
+        const uri = GmoUI.$("#otp-uri", form);
+        const label = GmoUI.$("#otp-label", form);
+        if (!uri || !label)
+            return;
+        otp.uri = uri.value;
+        otp.label = label.value;
+        try {
+            await api("/api/otp", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ input: otp.uri, label: otp.label }),
+            });
+            otp.uri = "";
+            otp.label = "";
+            renderOtp();
+        }
+        catch (error) {
+            fail(error);
+        }
+    }
+    // -------------------------------------------------------------- settings
+    function settingsShell() {
+        return `
+      <section class="intro">
+        <div><h1>Settings</h1><p class="muted">${WEB ? "Appearance, hosted access, release notes and data cleanup." : "Appearance, local paths, release notes and data cleanup."}</p></div>
+        <div class="intro-actions"><span class="chip live">owner ${esc(settingsState.owner || "drifter1987")}</span></div>
+      </section>
+      <p class="note">${WEB ? "This hosted build keeps Mail/SMS on the web API and OTP in this browser. There is no account, subscription or remote license server." : "GMO TempTools is local-only. There is no account, subscription or remote license server in this build."}</p>
+      <div class="panel">
+        <div class="panel-row"><span>Appearance</span><span><select class="select" id="appearance" aria-label="Appearance"><option value="dark">Dark</option><option value="light">Light</option></select></span></div>
+        <div class="panel-row"><span>Owner</span><span id="settings-owner">${esc(settingsState.owner)}</span></div>
+        <div class="panel-row"><span>Version</span><span id="settings-version">${esc(settingsState.version)}</span></div>
+      </div>
+      <div class="panel">
+        <div class="row-between"><strong>${WEB ? "Notification preference" : "Desktop notifications"}</strong><span class="chip">${WEB ? "stored preference" : "native only"}</span></div>
+        <p class="muted small">${WEB ? "The hosted web build stores this preference, but cannot show the desktop app's native toasts. OTP codes are never notified." : "Toasts run in the desktop app while its window is hidden. OTP codes are never notified."}</p>
+        <div class="panel-row"><label for="notify-enabled">Show desktop notifications</label><input type="checkbox" id="notify-enabled"></div>
+        <div class="panel-row"><label for="notify-mail">New mail</label><input type="checkbox" id="notify-mail"></div>
+        <div class="panel-row"><label for="notify-sms">New texts</label><input type="checkbox" id="notify-sms"></div>
+        <div class="panel-row"><span></span><button class="btn" data-action="settings-test">Send test notification</button></div>
+      </div>
+      ${WEB ? `<div class="panel">
+        <div class="row-between"><strong>Hosted access</strong><span class="chip live">web build</span></div>
+        <p class="muted small">Mail and SMS data are stored on the web API for this browser. OTP secrets never leave this browser. There is no installation key, account or remote license in this build.</p>
+      </div>` : `<div class="panel">
+        <div class="row-between"><strong>Installation key and access</strong><span class="chip">per install</span></div>
+        <p class="muted small">The key unlocks only this PC's local web app and APIs. Each installation creates its own key on first launch. To let someone use the app on another PC, install it there — there is no central key issuer or user list in this build.</p>
+        <div id="settings-key" class="muted small">Loading key path…</div>
+      </div>
+      <div class="panel">
+        <div class="row-between"><strong>Local paths</strong><span class="muted small">stored on this device only</span></div>
+        <div id="settings-paths"><p class="muted small">Loading paths…</p></div>
+      </div>`}
+      <h2 class="settings-h2">Release notes and changelog</h2>
+      <div id="settings-notes"><p class="muted small">Loading release notes…</p></div>
+      <div class="panel danger-panel">
+        <div class="row-between"><strong>Clear all data</strong><span class="chip demo">destructive</span></div>
+        <p class="muted small">${WEB ? "Deletes the hosted Mail/SMS metadata for this browser and the OTP/settings data stored here. Provider data and carrier billing are outside this app." : "Deletes Mail, SMS, the OTP vault, settings, the installation key and logs. Provider data and carrier billing are outside this app. Restart afterward."}</p>
+        <button class="btn danger" data-action="settings-clear">Clear all data…</button>
+      </div>
+      <p class="muted small" id="settings-status">${esc(settingsState.status)}</p>`;
+    }
+    function renderSettings() {
+        app.innerHTML = settingsShell();
+        void loadSettings();
+    }
+    async function loadSettings() {
+        try {
+            const data = await api("/api/settings");
+            if (current !== "settings")
+                return;
+            settingsState.appearance = data.appearance === "light" ? "light" : "dark";
+            settingsState.notifications = data.notifications ?? settingsState.notifications;
+            settingsState.owner = data.owner ?? "";
+            settingsState.version = data.version ?? "";
+            settingsState.paths = data.paths ?? [];
+            settingsState.notes = data.release_notes ?? [];
+            paintSettings();
+        }
+        catch (error) {
+            fail(error);
+        }
+    }
+    function paintSettings() {
+        document.documentElement.dataset.theme = settingsState.appearance;
+        const picker = GmoUI.$("#appearance");
+        if (picker)
+            picker.value = settingsState.appearance;
+        const enabled = GmoUI.$("#notify-enabled");
+        if (enabled)
+            enabled.checked = settingsState.notifications.enabled;
+        const mailNotify = GmoUI.$("#notify-mail");
+        if (mailNotify) {
+            mailNotify.checked = settingsState.notifications.mail;
+            mailNotify.disabled = !settingsState.notifications.enabled;
+        }
+        const smsNotify = GmoUI.$("#notify-sms");
+        if (smsNotify) {
+            smsNotify.checked = settingsState.notifications.sms;
+            smsNotify.disabled = !settingsState.notifications.enabled;
+        }
+        const owner = GmoUI.$("#settings-owner");
+        if (owner)
+            owner.textContent = settingsState.owner || "drifter1987";
+        const version = GmoUI.$("#settings-version");
+        if (version)
+            version.textContent = settingsState.version || "—";
+        const key = GmoUI.$("#settings-key");
+        const keyPath = settingsState.paths.find((row) => row.label === "Installation key");
+        if (key) {
+            key.innerHTML = keyPath
+                ? `<div class="path-row"><code>${esc(keyPath.path)}</code><button class="btn small" data-copy="${esc(keyPath.path)}">Copy path</button></div><p class="muted small">Use <code>./run-all.sh token</code> only in a development checkout; an installed app shows the same key in Settings.</p>`
+                : "Key path unavailable.";
+        }
+        const paths = GmoUI.$("#settings-paths");
+        if (paths) {
+            paths.innerHTML = settingsState.paths.length === 0
+                ? '<p class="muted small">No paths reported.</p>'
+                : settingsState.paths
+                    .map((row) => `<div class="path-row"><span>${esc(row.label)}</span><code>${esc(row.path)}</code><button class="btn small" data-copy="${esc(row.path)}">Copy</button></div>`)
+                    .join("");
+        }
+        const notes = GmoUI.$("#settings-notes");
+        if (notes) {
+            notes.innerHTML = settingsState.notes.length === 0
+                ? '<p class="muted small">No release notes reported.</p>'
+                : settingsState.notes
+                    .map((note) => `<details class="guide"><summary><strong>${esc(note.tool)} ${esc(note.version)}</strong> — ${esc(note.summary)}</summary><ol>${note.changelog
+                    .map((entry) => `<li><span class="mono">${esc(entry.version)}</span> · ${esc(entry.change)}</li>`)
+                    .join("")}</ol></details>`)
+                    .join("");
+        }
+        const status = GmoUI.$("#settings-status");
+        if (status)
+            status.textContent = settingsState.status;
+    }
+    async function changeAppearance(appearance) {
+        try {
+            const data = await api("/api/settings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ appearance }),
+            });
+            settingsState.appearance = data.appearance === "light" ? "light" : "dark";
+            paintSettings();
+            toast(`Appearance set to ${settingsState.appearance}.`);
+        }
+        catch (error) {
+            paintSettings();
+            fail(error);
+        }
+    }
+    async function saveNotificationSettings() {
+        const enabled = GmoUI.$("#notify-enabled");
+        const mail = GmoUI.$("#notify-mail");
+        const sms = GmoUI.$("#notify-sms");
+        if (!enabled || !mail || !sms)
+            return;
+        try {
+            const data = await api("/api/settings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ notifications: { enabled: enabled.checked, mail: mail.checked, sms: sms.checked } }),
+            });
+            settingsState.notifications = data.notifications ?? settingsState.notifications;
+            paintSettings();
+            toast("Notification preferences saved.");
+        }
+        catch (error) {
+            // Revert the controls to the last settings known to be on disk.
+            paintSettings();
+            fail(error);
+        }
+    }
+    async function testNotification() {
+        if (WEB) {
+            toast("Native desktop notifications are not part of the hosted web build.");
+            return;
+        }
+        try {
+            await api("/api/notifications/test", { method: "POST" });
+            toast("Test notification sent.");
+        }
+        catch (error) {
+            fail(error);
+        }
+    }
+    async function clearAllData(button) {
+        const message = WEB
+            ? "Delete the hosted Mail/SMS data for this browser and the OTP/settings stored in this browser? This cannot be undone."
+            : "Delete all local GMO TempTools data, including the OTP vault and installation key? This cannot be undone.";
+        if (!confirm(message))
+            return;
+        button.disabled = true;
+        try {
+            await api("/api/clear-data", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ confirm: "CLEAR" }),
+            });
+            if (WEB) {
+                try {
+                    localStorage.removeItem(LOCAL_OTP_KEY);
+                    localStorage.removeItem(CLIENT_ID_KEY);
+                }
+                catch {
+                    // Storage may be unavailable in a private window.
+                }
+            }
+            settingsState.status = WEB
+                ? "Hosted data cleared. Reload the page to start fresh."
+                : "All local data cleared. Restart GMO TempTools to create a new installation key.";
+            paintSettings();
+            toast(WEB ? "Hosted data cleared. Reload the page." : "Local data cleared. Restart the app.", 5000);
+        }
+        catch (error) {
+            fail(error);
+        }
+        finally {
+            button.disabled = false;
+        }
+    }
+    // ---------------------------------------------------------------- actions
+    async function handleAction(action, id, index) {
+        if (current === "settings") {
+            if (action === "settings-clear") {
+                const button = GmoUI.$('[data-action="settings-clear"]');
+                if (button)
+                    await clearAllData(button);
+            }
+            if (action === "settings-test")
+                await testNotification();
+            return;
+        }
+        if (current === "mail") {
+            if (action === "mail-new")
+                return createInbox(GmoUI.$('[data-action="mail-new"]'));
+            if (action === "mail-select") {
+                mail.selected = id;
+                mail.detail = null;
+                mail.messages = [];
+                paintMailThread();
+                void loadMailMessages();
+                return;
+            }
+            if (action === "mail-open")
+                return openMailMessage(id);
+            if (action === "mail-refresh") {
+                await loadMail(renderToken, true);
+                return;
+            }
+            if (action === "mail-delete") {
+                if (!confirm("Delete this inbox and its messages?"))
+                    return;
+                await api(`/api/mail/api/inboxes/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => null);
+                mail.selected = null;
+                mail.messages = [];
+                mail.detail = null;
+                await loadMail(renderToken);
+                return;
+            }
+        }
+        if (current === "sms") {
+            if (action === "sms-check")
+                return checkSmsSource();
+            if (action === "sms-select") {
+                sms.selected = id;
+                sms.detail = null;
+                sms.messages = [];
+                paintSmsThread();
+                void loadSmsMessages();
+                return;
+            }
+            if (action === "sms-open")
+                return openSmsMessage(id);
+            if (action === "sms-refresh") {
+                await loadSmsMessages(true);
+                return;
+            }
+            if (action === "sms-delete") {
+                if (!confirm("Delete this number and its messages?"))
+                    return;
+                await api(`/api/sms/api/numbers/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => null);
+                sms.selected = null;
+                sms.messages = [];
+                sms.detail = null;
+                await loadSms(renderToken);
+                return;
+            }
+        }
+        if (current === "otp") {
+            if (action === "otp-tab") {
+                const tab = (id || "extract");
+                otp.tab = tab;
+                renderOtp();
+                return;
+            }
+            if (action === "otp-extract")
+                return extractOtp();
+            if (action === "otp-clear") {
+                otp.paste = "";
+                otp.found = null;
+                paintOtpExtract();
+                return;
+            }
+            if (action === "otp-remove") {
+                if (!confirm("Remove this authenticator account?"))
+                    return;
+                await api(`/api/otp/${index}`, { method: "DELETE" }).catch(() => null);
+                await loadOtp(renderToken);
+            }
+        }
+    }
+    app.addEventListener("click", (event) => {
+        const target = event.target;
+        if (!(target instanceof Element))
+            return;
+        const copyTarget = target.closest("[data-copy]");
+        if (copyTarget) {
+            event.preventDefault();
+            const value = copyTarget.dataset.copy;
+            if (value)
+                void copy(value);
+            return;
+        }
+        const actionTarget = target.closest("[data-action]");
+        if (!actionTarget)
+            return;
+        event.preventDefault();
+        const action = actionTarget.dataset.action;
+        if (!action)
+            return;
+        const id = actionTarget.dataset.id ?? actionTarget.dataset.tab ?? "";
+        const index = Number(actionTarget.dataset.index ?? "-1");
+        void handleAction(action, id, index);
+    });
+    app.addEventListener("submit", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLFormElement))
+            return;
+        event.preventDefault();
+        if (target.id === "sms-picker")
+            void addSmsNumber(target);
+        if (target.id === "otp-add")
+            void addOtp(target);
+    });
+    app.addEventListener("change", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLSelectElement))
+            return;
+        if (target.id === "sms-country") {
+            sms.country = target.value;
+            void loadSmsNumbers();
+        }
+        if (target.id === "sms-number")
+            sms.chosen = target.value;
+        if (target.id === "mail-provider")
+            mail.provider = target.value;
+        if (target.id === "appearance" && (target.value === "dark" || target.value === "light")) {
+            void changeAppearance(target.value);
+        }
+    });
+    app.addEventListener("change", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLInputElement) || target.type !== "checkbox")
+            return;
+        if (target.id === "notify-enabled" || target.id === "notify-mail" || target.id === "notify-sms") {
+            void saveNotificationSettings();
+        }
+    });
+    app.addEventListener("input", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement))
+            return;
+        if (target.id === "otp-text")
+            otp.paste = target.value;
+        if (target.id === "otp-uri")
+            otp.uri = target.value;
+        if (target.id === "otp-label")
+            otp.label = target.value;
+        if (target.id === "mail-provider")
+            mail.provider = target.value;
+    });
+    document.querySelectorAll("#main-tabs .main-tab").forEach((button) => {
+        button.addEventListener("click", () => {
+            const screen = button.dataset.screen ?? "";
+            if (isScreen(screen))
+                show(screen);
+        });
+    });
+    window.setInterval(updateTtls, 1000);
+    const initial = window.location.hash.replace("#", "");
+    show(isScreen(initial) ? initial : "mail");
+})();

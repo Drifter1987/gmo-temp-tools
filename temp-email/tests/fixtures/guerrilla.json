@@ -1,0 +1,24 @@
+{
+  "list": {
+    "list": [
+      {
+        "mail_id": 425,
+        "mail_from": "Guerrilla Mail <no-reply@example.com>",
+        "mail_subject": "Your verification code",
+        "mail_excerpt": "Use code 482913 to continue.",
+        "mail_date": "2026-11-13 20:01:00",
+        "mail_timestamp": 1780000000,
+        "mail_read": 0
+      }
+    ],
+    "count": 1,
+    "email": "test@guerrillamail.com",
+    "ts": 1780000000
+  },
+  "detail": {
+    "mail_from": "Guerrilla Mail <no-reply@example.com>",
+    "mail_subject": "Your verification code",
+    "mail_body": "<p>Use code 482913 to continue.</p>",
+    "mail_timestamp": 1780000000
+  }
+}

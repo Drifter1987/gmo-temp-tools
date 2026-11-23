@@ -1,0 +1,32 @@
+{
+  "list": {
+    "address": "k7fq2m@grabmail.io",
+    "alias": "hq8kd2m4p7zt@alias-domain.example",
+    "count": 1,
+    "next": null,
+    "messages": [
+      {
+        "id": "01JR8W2K4Q",
+        "from": "no-reply@example.com",
+        "from_name": "Example",
+        "subject": "Your verification code",
+        "preview": "Your code is 481920. It expires in 10 minutes.",
+        "has_html": false,
+        "date": "2026-08-04T18:31:07Z",
+        "seen": true,
+        "attachments": 0,
+        "expires_at": "2026-08-09T18:31:07Z"
+      }
+    ]
+  },
+  "detail": {
+    "id": "01JR8W2K4Q",
+    "from": "no-reply@example.com",
+    "to": "k7fq2m@grabmail.io",
+    "subject": "Your verification code",
+    "date": "2026-08-04T18:31:07Z",
+    "text": "Your code is 481920. It expires in 10 minutes.",
+    "html": null,
+    "attachments": []
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "gmo-temp-services",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Typed browser assets for the GMO TempTools desktop app",
+  "scripts": {
+    "build:web": "tsc -p tsconfig.json",
+    "check:web": "tsc -p tsconfig.json --noEmit",
+    "check:e2e": "tsc -p tsconfig.e2e.json --noEmit",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "install:e2e": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
+}

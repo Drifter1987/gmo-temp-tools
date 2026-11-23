@@ -1,0 +1,17 @@
+node_modules/
+target/
+.build/
+.run/
+dist/
+playwright-report/
+test-results/
+.freebuff/
+.wrangler/
+.env
+.dev.vars
+
+# Runtime state written when the app runs from a development checkout.
+/settings.json
+/temp-email/state/
+/temp-sms/state/
+/temp-otp/state/

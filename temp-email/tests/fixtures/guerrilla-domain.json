@@ -1,0 +1,27 @@
+{
+  "list": {
+    "list": [
+      {
+        "mail_id": 426,
+        "mail_from": "Guerrilla Mail <no-reply@guerrillamailblock.com>",
+        "mail_subject": "Guerrilla Mail notice",
+        "mail_excerpt": "A message from the inbox's own domain.",
+        "mail_date": "2026-11-15 05:46:00",
+        "mail_timestamp": 1780000001,
+        "mail_read": 0
+      },
+      {
+        "mail_id": 427,
+        "mail_from": "Example <noreply@example.test>",
+        "mail_subject": "Your verification code",
+        "mail_excerpt": "Use code 482913 to continue.",
+        "mail_date": "2026-11-15 05:46:01",
+        "mail_timestamp": 1780000002,
+        "mail_read": 0
+      }
+    ],
+    "count": 2,
+    "email": "test@guerrillamailblock.com",
+    "ts": 1780000002
+  }
+}

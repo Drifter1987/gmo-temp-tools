@@ -1,0 +1,7 @@
+[package]
+name = "desktop-notifications"
+version = "0.1.0"
+edition = "2021"
+
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7"

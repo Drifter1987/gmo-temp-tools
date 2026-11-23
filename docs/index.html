@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d1211">
+  <title>GMO TempTools</title>
+  <link rel="stylesheet" href="./app.css">
+  <script>window.TEMPTOOLS_API_BASE = "https://gmo-temptools-web-api-z1jsh3.freebuff.site";</script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="dot"></span> GMO <span class="brand-dim">TempTools</span></a>
+    <span class="top-status" id="mode-status"><span class="pulse"></span> local only</span>
+  </header>
+  <nav class="main-tabs" id="main-tabs" aria-label="Tools">
+    <button class="main-tab" data-screen="mail">Mail</button>
+    <button class="main-tab" data-screen="sms">SMS <span class="tab-beta">Beta</span></button>
+    <button class="main-tab" data-screen="otp">OTP</button>
+    <button class="main-tab" data-screen="settings">Settings</button>
+  </nav>
+  <main class="wrap" id="app">
+    <p class="muted">Loading GMO TempTools…</p>
+  </main>
+  <footer class="foot">
+    <span>GMO TempTools</span>
+    <span class="sep">·</span>
+    <span id="footer-mode">mail 8781 · texts 8782 · otp local</span>
+  </footer>
+  <script src="./ui.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

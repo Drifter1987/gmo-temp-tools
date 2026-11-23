@@ -1,0 +1,88 @@
+name: Windows checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    # Set the repository variable WINDOWS_RUNNER to a self-hosted Windows 11
+    # runner label when exact Windows 11 coverage is required. Hosted
+    # windows-latest is Windows Server, because GitHub does not publish a
+    # Windows 11 hosted image.
+    runs-on: ${{ vars.WINDOWS_RUNNER || 'windows-latest' }}
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+      RUSTFLAGS: -D warnings
+      CARGO_TERM_COLOR: always
+      TEMPTOOLS_AUTH_TOKEN: ci-temptools-token
+      TEMPTOOLS_STATE_DIR: "${{ github.workspace }}\\.run\\e2e-state"
+      TEMPTOOLS_HEADLESS: "1"
+      TWILIO_AUTH_TOKEN: test-token
+      TELNYX_PUBLIC_KEY: "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw="
+      WEBHOOK_SECRET: test-secret
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Set up the MSVC linker environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+
+      - name: Build the apps and browser assets
+        shell: bash
+        run: bash ./scripts/build.sh
+
+      - name: Start the app in headless test mode
+        shell: bash
+        run: |
+          mkdir -p .run/e2e-state
+          bash ./scripts/run-all.sh start
+
+      - name: Run the full check suite
+        shell: bash
+        run: bash ./scripts/check.sh
+
+      - name: Run browser-level Playwright tests
+        shell: bash
+        run: npx playwright test
+
+      - name: Stop the test app
+        if: always()
+        shell: bash
+        run: bash ./scripts/run-all.sh stop || true
+
+      - name: Upload Playwright artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore

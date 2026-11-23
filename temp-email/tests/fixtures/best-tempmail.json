@@ -1,0 +1,28 @@
+{
+  "list": {
+    "success": true,
+    "address": "myprefix@alagen.site",
+    "messages": [
+      {
+        "id": "a1b2c3d4e5f6a7b8",
+        "from": "noreply@service.com",
+        "subject": "Your verification code",
+        "date": "2026-07-04T20:01:00.000Z",
+        "has_attachments": false
+      }
+    ]
+  },
+  "detail": {
+    "success": true,
+    "message": {
+      "id": "a1b2c3d4e5f6a7b8",
+      "from": "\"Service\" <noreply@service.com>",
+      "to": "myprefix@alagen.site",
+      "subject": "Your verification code",
+      "date": "2026-07-04T20:01:00.000Z",
+      "text": "Your code is 123456",
+      "html": "<p>Your code is 123456</p>",
+      "attachments": []
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "list": {
+    "data": {
+      "items": [
+        {
+          "id": "5a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+          "from": "noreply@github.com",
+          "subject": "Your verification code",
+          "received_at": "2026-11-13T20:01:00Z",
+          "verification_code": "482913",
+          "has_html": true,
+          "has_text": true,
+          "attachment_count": 0
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  "detail": {
+    "data": {
+      "id": "5a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+      "from": "noreply@github.com",
+      "subject": "Your verification code",
+      "received_at": "2026-11-13T20:01:00Z",
+      "verification_code": "482913",
+      "has_html": true,
+      "has_text": true,
+      "attachment_count": 0,
+      "inbox_id": "9e8d7c6b-5a4f-3e2d-1c0b-9a8f7e6d5c4b",
+      "html": "<p>Use code 482913 to continue.</p>",
+      "text": "Use code 482913 to continue.",
+      "attachments": []
+    }
+  }
+}
