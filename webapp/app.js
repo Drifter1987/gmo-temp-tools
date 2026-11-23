@@ -594,11 +594,11 @@
         <div class="split-list" id="sms-list"><div class="pad muted">No numbers loaded.</div></div>
         <div class="split-main" id="sms-thread"><div class="empty-reading"><p class="muted">Select a number to read its texts.</p></div></div>
       </div>
-      ${WEB ? "" : "<div id=\"sms-webhook\"></div>"}
+      ${WEB ? "" : `<div id="sms-webhook"></div>
       <details class="guide"><summary>Webhook and limits</summary>
         <p>Signed inbound texts: <code>POST /api/inbound/sms</code> on port 8782. Twilio uses <code>TWILIO_AUTH_TOKEN</code>, Telnyx uses <code>TELNYX_PUBLIC_KEY</code>, and anything else needs <code>WEBHOOK_SECRET</code>. An unset contract answers 503.</p>
         <p>A carrier retry is matched by its message id. A generic payload without an id is stored again on retry.</p>
-      </details>`;
+      </details>`}`;
         void loadSms(token);
     }
     async function loadSms(token) {
