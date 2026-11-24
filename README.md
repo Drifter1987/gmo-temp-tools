@@ -41,7 +41,10 @@ polling traffic does not spend the write budget.
   and pass `?token=...` to keep the probe endpoint private.
 
 The Mail tab shows each provider's current state and when it was last checked;
-the SMS tab shows the source status and its last success time.
+the SMS tab shows the source status and its last success time. **Settings →
+Upstream status** lists all four providers (mail and SMS) with their current
+state, last error and last check time. While a hosted tab is open, new mail in
+any inbox raises a toast; polling pauses while the tab is hidden.
 
 ### OTP vault backup
 
@@ -52,7 +55,25 @@ choose; the same panel imports that file, or its pasted JSON, back into this or
 another browser and merges accounts that are not already present. Encryption
 and decryption run in the page with WebCrypto: the passphrase and the ciphertext
 are never sent to the API, and the passphrase is never stored. There is no
-recovery, so a forgotten passphrase means the backup cannot be opened.
+recovery, so a forgotten passphrase means the backup cannot be opened. Accounts
+can be renamed and reordered in the list, and the backup panel tracks the last
+export locally, showing “backup needed” until one has been made.
+
+### Install and offline
+
+The Pages build ships a web app manifest and a service worker, so it can be
+installed from the browser. Only the same-origin shell (HTML, CSS, JS, icons) is
+cached: the OTP extractor and the local vault keep working offline, while Mail
+and SMS show an offline banner because their API is remote. Inboxes, numbers and
+provider responses are never written to the cache.
+
+### Content policy
+
+The hosted page runs under a `Content-Security-Policy` meta tag: scripts and the
+manifest must come from the page origin, API calls and the sandboxed HTML mail
+view are limited to the hosted API origin, and inline script cannot reach the
+vault. The API base moved from an inline script to `docs/config.js` so
+`script-src 'self'` can hold; the desktop build keeps its plain head.
 
 The hosted build has no account system. A random browser client ID scopes the
 Mail/SMS metadata stored in D1, and **Settings → Clear all data** removes it.

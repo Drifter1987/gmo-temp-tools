@@ -29,6 +29,16 @@
     last_success_at?: number;
     last_failure_at?: number;
   }
+  interface HealthProvider {
+    provider: string;
+    label: string;
+    kind: string;
+    status: string;
+    consecutive_failures: number;
+    last_error: string;
+    last_success_at: number;
+    last_attempt_at: number;
+  }
   interface MailLast { sender: string; subject: string; preview?: string; received_at: number }
   interface MailInbox {
     id: string;
@@ -141,6 +151,7 @@
   const WEB = API_BASE.length > 0;
   const CLIENT_ID_KEY = "gmo-temptools.client.v1";
   const LOCAL_OTP_KEY = "gmo-temptools.otp.v1";
+  const LOCAL_OTP_BACKUP_KEY = "gmo-temptools.otp.backup-at.v1";
 
   const app = GmoUI.$<HTMLElement>("#app") as HTMLElement;
 
@@ -155,6 +166,7 @@
     health: [] as ProviderHealth[],
     healthUnavailable: false,
     inboxes: [] as MailInbox[],
+    unread: {} as Record<string, number>,
     selected: null as string | null,
     messages: [] as MailMessage[],
     detail: null as MailDetail | null,
@@ -188,6 +200,7 @@
     version: "",
     paths: [] as SettingsPath[],
     notes: [] as ToolRelease[],
+    health: [] as HealthProvider[],
     status: "",
   };
 
@@ -196,6 +209,14 @@
     if (mode) mode.innerHTML = '<span class="pulse"></span> hosted web';
     const footer = GmoUI.$<HTMLElement>("#footer-mode");
     if (footer) footer.textContent = "mail + SMS via API · otp in this browser";
+    if ("serviceWorker" in navigator) {
+      void navigator.serviceWorker.register("./sw.js").catch(() => {
+        // Without a worker the app still works online; offline is a bonus.
+      });
+    }
+    window.addEventListener("online", paintConnectivity);
+    window.addEventListener("offline", paintConnectivity);
+    paintConnectivity();
   }
 
   function isScreen(value: string): value is Screen {
@@ -209,6 +230,21 @@
 
   function addTimer(callback: () => void, milliseconds: number): void {
     timers.push(window.setInterval(callback, milliseconds));
+  }
+
+  function paintConnectivity(): void {
+    if (!WEB) return;
+    let banner = document.getElementById("offline-banner");
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "offline-banner";
+      banner.className = "offline-banner";
+      banner.setAttribute("role", "status");
+      banner.textContent =
+        "Offline — Mail and SMS need a connection. OTP and the saved vault still work.";
+      document.body.appendChild(banner);
+    }
+    banner.hidden = navigator.onLine;
   }
 
   function clientId(): string {
@@ -534,6 +570,15 @@
       mail.healthUnavailable = !acceptance?.provider_health;
       if (acceptance?.provider_health) mail.health = acceptance.provider_health;
       mail.inboxes = list.inboxes ?? [];
+      for (const inbox of mail.inboxes) {
+        const previous = mail.unread[inbox.id];
+        if (previous !== undefined && inbox.unread > previous) {
+          toast(`New mail in ${inbox.address}`, 3_500);
+        }
+      }
+      mail.unread = Object.fromEntries(
+        mail.inboxes.map((inbox) => [inbox.id, inbox.unread]),
+      );
       if (mail.selected && !mail.inboxes.some((inbox) => inbox.id === mail.selected)) {
         mail.selected = null;
         mail.detail = null;
@@ -1136,7 +1181,7 @@
 
   function otpBackupPanel(): string {
     return `<div class="panel" id="otp-backup">
-      <div class="row-between"><strong>Encrypted backup</strong><span class="chip">client-side</span></div>
+      <div class="row-between"><strong>Encrypted backup</strong><span class="chip" id="otp-backup-age">no backup yet</span></div>
       <p class="muted small">Export a passphrase-encrypted file before clearing site data or switching browsers. Encryption (PBKDF2 + AES-GCM) runs here; the passphrase and the backup never leave this browser. Without the passphrase the file cannot be opened.</p>
       <div class="panel-row"><label for="otp-export-pass">Export passphrase</label><input class="input" id="otp-export-pass" type="password" autocomplete="new-password" placeholder="At least 8 characters"></div>
       <div class="panel-row"><label for="otp-export-confirm">Confirm passphrase</label><input class="input" id="otp-export-confirm" type="password" autocomplete="new-password"></div>
@@ -1178,6 +1223,12 @@
       const confirmInput = GmoUI.$<HTMLInputElement>("#otp-export-confirm");
       if (passInput) passInput.value = "";
       if (confirmInput) confirmInput.value = "";
+      try {
+        localStorage.setItem(LOCAL_OTP_BACKUP_KEY, String(Date.now()));
+      } catch {
+        // A private window may refuse storage; the download itself still works.
+      }
+      paintOtpSecrets();
       setBackupStatus(`Encrypted backup of ${backup.count} account(s) downloaded. Keep the passphrase safe; it cannot be recovered.`);
       toast("Encrypted backup downloaded.");
     } catch (error) {
@@ -1263,10 +1314,31 @@
             const pct = Math.max(0, Math.min(100, (secret.remaining / Math.max(1, secret.period)) * 100));
             return `<div class="secret"><div class="row-between">
               <div><div><strong>${esc(secret.label)}</strong></div><div class="muted small">${esc(secret.algorithm)} · ${secret.digits} digits · ${secret.period}s · ${esc(secret.masked)}</div></div>
-              <div class="row"><span class="secret-code">${esc(secret.code)}</span><button class="btn small" data-copy="${esc(secret.code)}">Copy</button><button class="btn small danger" data-action="otp-remove" data-index="${secret.index}">Remove</button></div>
+              <div class="row"><span class="secret-code">${esc(secret.code)}</span><button class="btn small" data-copy="${esc(secret.code)}">Copy</button>${WEB ? `<button class="btn small" data-action="otp-rename" data-index="${secret.index}" title="Rename this account">Rename</button><button class="btn small" data-action="otp-move" data-index="${secret.index}" data-id="up" title="Move up" ${secret.index === 0 ? "disabled" : ""}>↑</button><button class="btn small" data-action="otp-move" data-index="${secret.index}" data-id="down" title="Move down" ${secret.index === otp.secrets.length - 1 ? "disabled" : ""}>↓</button>` : ""}<button class="btn small danger" data-action="otp-remove" data-index="${secret.index}">Remove</button></div>
             </div><div class="progress"><span style="width:${pct}%"></span></div><div class="muted small" style="margin-top:4px">${secret.remaining}s left</div></div>`;
           })
           .join("");
+    const backupAge = GmoUI.$<HTMLElement>("#otp-backup-age");
+    if (backupAge) {
+      let backedUpAt = 0;
+      try {
+        backedUpAt = Number(localStorage.getItem(LOCAL_OTP_BACKUP_KEY) || 0);
+      } catch {
+        backedUpAt = 0;
+      }
+      if (otp.secrets.length === 0) {
+        backupAge.textContent = "no accounts";
+        backupAge.className = "chip";
+      } else if (!backedUpAt) {
+        backupAge.textContent = "backup needed";
+        backupAge.className = "chip demo";
+        backupAge.title = "Export an encrypted backup before clearing site data.";
+      } else {
+        backupAge.textContent = `backup ${GmoUI.age(backedUpAt)}`;
+        backupAge.className = "chip live";
+        backupAge.title = `Last encrypted export ${new Date(backedUpAt).toLocaleString()}`;
+      }
+    }
   }
 
   async function loadOtp(token: number): Promise<void> {
@@ -1349,6 +1421,11 @@
         <div class="row-between"><strong>Local paths</strong><span class="muted small">stored on this device only</span></div>
         <div id="settings-paths"><p class="muted small">Loading paths…</p></div>
       </div>`}
+      ${WEB ? `<div class="panel">
+        <div class="row-between"><strong>Upstream status</strong><span class="chip" id="settings-health-chip">…</span></div>
+        <p class="muted small">Recorded by the hosted API. Mail falls back automatically when a provider fails; a warning row is failing right now.</p>
+        <div id="settings-health"><p class="muted small">Loading provider health…</p></div>
+      </div>` : ""}
       <h2 class="settings-h2">Release notes and changelog</h2>
       <div id="settings-notes"><p class="muted small">Loading release notes…</p></div>
       <div class="panel danger-panel">
@@ -1374,6 +1451,12 @@
       settingsState.version = data.version ?? "";
       settingsState.paths = data.paths ?? [];
       settingsState.notes = data.release_notes ?? [];
+      if (WEB) {
+        const health = await api<{ providers?: HealthProvider[] }>("/api/health").catch(
+          () => null,
+        );
+        settingsState.health = health?.providers ?? [];
+      }
       paintSettings();
     } catch (error) {
       fail(error);
@@ -1414,6 +1497,25 @@
         : settingsState.paths
             .map((row) => `<div class="path-row"><span>${esc(row.label)}</span><code>${esc(row.path)}</code><button class="btn small" data-copy="${esc(row.path)}">Copy</button></div>`)
             .join("");
+    }
+    const healthHolder = GmoUI.$<HTMLElement>("#settings-health");
+    if (healthHolder) {
+      healthHolder.innerHTML = settingsState.health.length === 0
+        ? '<p class="muted small">No health snapshot yet. The API records one when its probe runs.</p>'
+        : settingsState.health
+            .map((provider) => {
+              const chip =
+                provider.status === "ok" ? "live" : provider.status === "error" ? "demo" : "";
+              return `<div class="path-row"><span>${esc(provider.label || provider.provider)}</span><span class="chip ${chip}">${esc(provider.status)}</span><code>${esc(provider.status === "error" ? provider.last_error || "failing" : provider.kind)}</code><span class="muted small">${provider.last_attempt_at ? GmoUI.age(provider.last_attempt_at) : "never"}</span></div>`;
+            })
+            .join("");
+    }
+    const healthChip = GmoUI.$<HTMLElement>("#settings-health-chip");
+    if (healthChip) {
+      const failing = settingsState.health.filter((provider) => provider.status === "error").length;
+      healthChip.textContent =
+        settingsState.health.length === 0 ? "no data" : failing > 0 ? `${failing} failing` : "all ok";
+      healthChip.className = `chip ${failing > 0 ? "demo" : settingsState.health.length > 0 ? "live" : ""}`;
     }
     const notes = GmoUI.$<HTMLElement>("#settings-notes");
     if (notes) {
@@ -1592,6 +1694,36 @@
         if (!confirm("Remove this authenticator account?")) return;
         await api(`/api/otp/${index}`, { method: "DELETE" }).catch(() => null);
         await loadOtp(renderToken);
+        return;
+      }
+      if (action === "otp-rename") {
+        if (!WEB) return;
+        const secrets = loadLocalSecrets();
+        const currentLabel = secrets[index]?.label ?? "";
+        const next = window.prompt("Rename authenticator account", currentLabel);
+        if (next === null) return;
+        const clean = next.trim().slice(0, 80);
+        if (!clean) {
+          toast("A label is required.");
+          return;
+        }
+        if (secrets[index]) {
+          secrets[index].label = clean;
+          saveLocalSecrets(secrets);
+          await loadOtp(renderToken);
+        }
+        return;
+      }
+      if (action === "otp-move") {
+        if (!WEB) return;
+        const secrets = loadLocalSecrets();
+        const target = index + (id === "up" ? -1 : 1);
+        if (index >= 0 && index < secrets.length && target >= 0 && target < secrets.length) {
+          const [moved] = secrets.splice(index, 1);
+          secrets.splice(target, 0, moved);
+          saveLocalSecrets(secrets);
+          await loadOtp(renderToken);
+        }
         return;
       }
       if (action === "otp-export") return exportOtpVault();
