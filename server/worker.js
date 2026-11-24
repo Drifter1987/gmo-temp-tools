@@ -1,9 +1,14 @@
 // Serverless API for the hosted GMO TempTools web app.
 //
-// Mail.tm and receive-sms.io are fetched server-side so the browser never has
-// to deal with provider CORS rules. Everything stored here is public temporary
-// inbox/number metadata, scoped to a random browser client id. OTP secrets are
-// intentionally never sent to this service.
+// Guerrilla Mail and receive-sms.io are fetched server-side so the browser never
+// has to deal with provider CORS rules. Everything stored here is public
+// temporary inbox/number metadata, scoped to a random browser client id. OTP
+// secrets are intentionally never sent to this service.
+//
+// Mail.tm is deliberately not offered here: its edge rejects requests from
+// Cloudflare Workers with 403, so every Mail.tm call used to fall back. The
+// desktop app still supports Mail.tm; the read helpers below stay only so any
+// Mail.tm inbox created before this change can still be listed and deleted.
 
 const VERSION = "0.3.0";
 const MAIL_TTL_MS = 60 * 60 * 1000;
@@ -326,59 +331,9 @@ async function createGuerrillaInbox(db, client) {
   return { id, address: created.email_addr, provider: "guerrilla", created_at: createdAt, expires_at: expiresAt };
 }
 
-async function createMailInbox(db, client, requested = "mail.tm") {
-  let mailTmError = null;
-  if (requested !== "guerrilla") try {
-    const domain = await activeMailDomain();
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const address = `${randomLocalPart()}@${domain}`;
-      const password = `Gmo-${randomHex(24)}-${randomHex(12)}`;
-      try {
-        const account = await mailTm("/accounts", {
-          method: "POST",
-          body: JSON.stringify({ address, password }),
-        });
-        const auth = await mailTm("/token", {
-          method: "POST",
-          body: JSON.stringify({ address, password }),
-        });
-        const id = randomHex(20);
-        const createdAt = now();
-        const expiresAt = createdAt + MAIL_TTL_MS;
-        await db
-          .prepare(
-            `INSERT INTO mail_inboxes
-              (id, client_id, address, provider, password, token, remote_id, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .bind(
-            id,
-            client,
-            address,
-            "mail.tm",
-            password,
-            auth?.token || "",
-            account?.id || auth?.id || "",
-            createdAt,
-            expiresAt,
-          )
-          .run();
-        return { id, address, provider: "mail.tm", created_at: createdAt, expires_at: expiresAt };
-      } catch (error) {
-        mailTmError = error;
-        if (error.status !== 422) break;
-      }
-    }
-  } catch (error) {
-    mailTmError = error;
-  }
-  try {
-    return await createGuerrillaInbox(db, client);
-  } catch (error) {
-    throw new Error(
-      `Mail providers failed (Mail.tm: ${mailTmError ? mailTmError.message : "unavailable"}; Guerrilla Mail: ${error.message})`,
-    );
-  }
+async function createMailInbox(db, client) {
+  // One provider only: Guerrilla Mail is the only upstream this host can reach.
+  return createGuerrillaInbox(db, client);
 }
 
 async function refreshMailToken(db, inbox) {
@@ -556,19 +511,13 @@ async function mailRoute(request, sub, url, env, origin, client) {
         mode: "web",
         providers: [
           {
-            id: "mail.tm",
-            label: "Mail.tm",
-            address_rule: "random local part on Mail.tm's active domain",
-            inboxes: rows.filter((row) => row.provider === "mail.tm").length,
-          },
-          {
             id: "guerrilla",
             label: "Guerrilla Mail",
             address_rule: "provider-assigned Guerrilla domain",
             inboxes: rows.filter((row) => row.provider === "guerrilla").length,
           },
         ],
-        provider_rule: "server-side providers with automatic fallback",
+        provider_rule: "Guerrilla Mail, fetched server-side",
       },
       origin,
     );
@@ -586,14 +535,15 @@ async function mailRoute(request, sub, url, env, origin, client) {
     } catch {
       parsed = {};
     }
-    const requested = parsed?.provider || "mail.tm";
-    const created = await createMailInbox(env.DB, client, requested);
+    // Older cached pages may still ask for Mail.tm; the hosted API has no such
+    // provider, so any provider value resolves to Guerrilla Mail.
+    const created = await createMailInbox(env.DB, client);
     return json(
       200,
       {
         ...created,
-        requested_provider: requested,
-        fallback: requested !== created.provider,
+        requested_provider: parsed?.provider || created.provider,
+        fallback: false,
       },
       origin,
     );
@@ -1040,7 +990,7 @@ const RELEASE_NOTES = [
     version: "0.3.0",
     summary: "Disposable addresses, live inbox refresh and code extraction.",
     changelog: [
-      { version: "0.3.0", change: "Hosted web build using Mail.tm through the serverless API." },
+      { version: "0.3.0", change: "Hosted web build using Guerrilla Mail through the serverless API." },
     ],
   },
   {
@@ -1160,7 +1110,7 @@ export default {
           {
             mode: "web",
             version: VERSION,
-            mail: { provider: "mail.tm", inboxes: mail?.count || 0 },
+            mail: { provider: "guerrilla", inboxes: mail?.count || 0 },
             sms: { provider: "receive-sms.io", numbers: sms?.count || 0 },
             otp: "browser-local",
           },

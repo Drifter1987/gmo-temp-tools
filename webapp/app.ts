@@ -471,7 +471,9 @@
           <li>Create an inbox and paste the address into a signup form.</li>
           <li>The verification mail arrives here; the code is pulled out automatically.</li>
           <li>Inboxes and their mail are deleted an hour after creation.</li>
-          <li>Some senders block disposable domains; switching provider is the practical workaround.</li>
+          ${WEB
+            ? "<li>Some senders block disposable domains. The hosted API offers Guerrilla Mail, the provider it can reach; the desktop app adds Mail.tm.</li>"
+            : "<li>Some senders block disposable domains; switching provider is the practical workaround.</li>"}
         </ol>
         <p>No account is needed here. The message list is cached for a few seconds to stay inside provider free-tier limits.</p>
       </details>`;
@@ -524,6 +526,11 @@
   }
 
   function paintMail(): void {
+    // Providers can disappear between builds (the hosted API no longer offers
+    // Mail.tm). Never keep a selection the server does not provide.
+    if (mail.providers.length > 0 && !mail.providers.some((provider) => provider.id === mail.provider)) {
+      mail.provider = mail.providers[0].id;
+    }
     const picker = GmoUI.$<HTMLSelectElement>("#mail-provider");
     if (picker) {
       const options = mail.providers
