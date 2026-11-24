@@ -239,10 +239,14 @@ integration tests start their own transient listeners.
 - The hosted web build is not an account system. Its client ID is not a
   password, and public SMS inboxes are shared with anyone who opens the same
   page; upstream availability varies. SMS is therefore labelled **Beta**.
-- The hosted API rate limits every browser client (per-minute, ten-minute and
-  daily windows) and caps storage at 5 inboxes and 5 SMS numbers per client;
-  site-wide daily ceilings protect the shared provider quota. Limits answer
-  `429` with `Retry-After`, and bodies over 8 KiB are rejected with `413`.
+- The hosted API rate limits every browser client. Per-minute windows are
+  counted in Worker memory, so a polling tab costs no D1 writes; because a
+  client can be spread across several Worker instances, every 25th local
+  request also charges a shared minute counter in D1, which is what stops a
+  burst that memory alone would dilute. Ten-minute and daily windows plus the
+  site-wide provider ceilings are always stored in D1. Each client may hold 5
+  inboxes and 5 SMS numbers. Limits answer `429` with `Retry-After`, and bodies
+  over 8 KiB are rejected with `413`.
 - Carrier signature checks are tested with locally generated keys, not live
   carrier traffic.
 - The app is local-only by design. It is not a remote account system, and the

@@ -157,9 +157,11 @@ async function ensureSchema(db) {
   schemaReady = true;
 }
 
-// Fixed windows are enough here: they cost one small D1 row per client and
-// bucket, survive isolate restarts, and stay shared across every colo.
-const RATE_RULES = {
+// Per-minute windows stay in isolate memory. A single open tab polls about 24
+// requests a minute, so a D1 row per request would burn the 10k daily write
+// budget in a few hours. Memory is per colo and lost on isolate recycle, so
+// these are burst protection; the durable windows below guard real quota.
+const MEMORY_RULES = {
   read: [
     { bucket: "api-minute", window: MINUTE, max: 240 },
     { bucket: "read-minute", window: MINUTE, max: 180 },
@@ -171,16 +173,59 @@ const RATE_RULES = {
   mailCreate: [
     { bucket: "api-minute", window: MINUTE, max: 240 },
     { bucket: "write-minute", window: MINUTE, max: 40 },
-    { bucket: "mail-create-ten", window: 10 * MINUTE, max: 6 },
-    { bucket: "mail-create-day", window: DAY, max: 30 },
   ],
   smsCreate: [
     { bucket: "api-minute", window: MINUTE, max: 240 },
     { bucket: "write-minute", window: MINUTE, max: 40 },
+  ],
+};
+
+// Low-volume windows that spend provider quota or D1 storage: these stay in D1
+// because they must hold across isolates and colos.
+const DURABLE_RULES = {
+  mailCreate: [
+    { bucket: "mail-create-ten", window: 10 * MINUTE, max: 6 },
+    { bucket: "mail-create-day", window: DAY, max: 30 },
+  ],
+  smsCreate: [
     { bucket: "sms-create-ten", window: 10 * MINUTE, max: 6 },
     { bucket: "sms-create-day", window: DAY, max: 30 },
   ],
 };
+
+const memoryWindows = new Map();
+const MEMORY_SWEEP_INTERVAL_MS = 10 * MINUTE;
+const MEMORY_WINDOWS_MAX = 20_000;
+let lastMemorySweep = 0;
+// A request can land on any isolate, so a client's minute is spread over
+// several memory counters. Every Nth local request charges a shared counter in
+// D1 instead of writing once per request; normal polling (about 24 a minute)
+// never reaches the threshold, so an idle tab costs no D1 writes.
+const ESCALATE_EVERY = 25;
+const SHARED_MINUTE_MAX = 150;
+
+function sweepMemoryWindows(force = false) {
+  if (!force && now() - lastMemorySweep < MEMORY_SWEEP_INTERVAL_MS) return;
+  lastMemorySweep = now();
+  // Every in-memory window is one minute; anything older than two minutes is
+  // finished and can be dropped.
+  const cutoff = now() - 2 * MINUTE;
+  for (const [key, row] of memoryWindows) {
+    if (row.start < cutoff) memoryWindows.delete(key);
+  }
+}
+
+function memoryCount(client, bucket, window) {
+  const key = `${bucket}:${client}`;
+  const start = windowStart(window);
+  const row = memoryWindows.get(key);
+  if (!row || row.start !== start) {
+    memoryWindows.set(key, { start, count: 1 });
+    return 1;
+  }
+  row.count += 1;
+  return row.count;
+}
 
 // Site-wide ceilings on the calls that spend shared provider quota. The client
 // id is caller-supplied, so per-client limits alone are not enough.
@@ -199,17 +244,17 @@ function windowStart(window) {
   return Math.floor(now() / window) * window;
 }
 
-async function bumpCounter(db, client, bucket, window) {
+async function bumpCounterBy(db, client, bucket, window, amount) {
   const start = windowStart(window);
   // D1 does not surface the `RETURNING` row through .first() on a write, so
   // increment atomically and read the fresh count back explicitly.
   await db
     .prepare(
       `INSERT INTO rate_limits (client_id, bucket, window_start, count)
-       VALUES (?, ?, ?, 1)
-       ON CONFLICT(client_id, bucket, window_start) DO UPDATE SET count = count + 1`,
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(client_id, bucket, window_start) DO UPDATE SET count = count + ?`,
     )
-    .bind(client, bucket, start)
+    .bind(client, bucket, start, amount, amount)
     .run();
   const row = await db
     .prepare(
@@ -217,7 +262,11 @@ async function bumpCounter(db, client, bucket, window) {
     )
     .bind(client, bucket, start)
     .first();
-  return { count: Number(row?.count ?? 1), resetAt: start + window };
+  return { count: Number(row?.count ?? amount), resetAt: start + window };
+}
+
+async function bumpCounter(db, client, bucket, window) {
+  return bumpCounterBy(db, client, bucket, window, 1);
 }
 
 function retrySeconds(resetAt) {
@@ -225,7 +274,45 @@ function retrySeconds(resetAt) {
 }
 
 async function rateLimitHit(db, client, kind) {
-  for (const rule of RATE_RULES[kind] || RATE_RULES.read) {
+  sweepMemoryWindows(memoryWindows.size > MEMORY_WINDOWS_MAX);
+  const minute = windowStart(MINUTE);
+  // Once the shared ceiling is crossed, every later request from this client is
+  // rejected in this isolate, not just the escalation samples.
+  const blocked = memoryWindows.get(`blocked-minute:${client}`);
+  if (blocked && blocked.start === minute) {
+    return {
+      code: "rate_limited",
+      limit: SHARED_MINUTE_MAX,
+      retry_after: retrySeconds(minute + MINUTE),
+      window_seconds: 60,
+    };
+  }
+  let minuteCount = 0;
+  for (const rule of MEMORY_RULES[kind] || MEMORY_RULES.read) {
+    const count = memoryCount(client, rule.bucket, rule.window);
+    if (rule.bucket === "api-minute") minuteCount = count;
+    if (count > rule.max) {
+      return {
+        code: "rate_limited",
+        limit: rule.max,
+        retry_after: retrySeconds(windowStart(rule.window) + rule.window),
+        window_seconds: rule.window / 1000,
+      };
+    }
+  }
+  if (minuteCount > 0 && minuteCount % ESCALATE_EVERY === 0) {
+    const used = await bumpCounterBy(db, client, "api-minute-shared", MINUTE, ESCALATE_EVERY);
+    if (used.count > SHARED_MINUTE_MAX) {
+      memoryWindows.set(`blocked-minute:${client}`, { start: minute, count: 1 });
+      return {
+        code: "rate_limited",
+        limit: SHARED_MINUTE_MAX,
+        retry_after: retrySeconds(used.resetAt),
+        window_seconds: 60,
+      };
+    }
+  }
+  for (const rule of DURABLE_RULES[kind] || []) {
     const used = await bumpCounter(db, client, rule.bucket, rule.window);
     if (used.count > rule.max) {
       return {
