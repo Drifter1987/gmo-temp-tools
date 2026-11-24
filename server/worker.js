@@ -17,6 +17,16 @@ const MAIL_BASE = "https://api.mail.tm";
 const SMS_BASE = "https://receive-sms.io";
 const SMS_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+// One browser may hold a handful of temporary resources, and every creation
+// also counts against site-wide ceilings so rotating client ids cannot drain
+// the upstream providers or grow D1 without bound.
+const MAX_MAIL_INBOXES = 5;
+const MAX_SMS_NUMBERS = 5;
+const MAX_JSON_BYTES = 8 * 1024;
+const CLEANUP_INTERVAL_MS = HOUR;
 const ALLOWED_ORIGINS = new Set([
   "https://drifter1987.github.io",
   "https://Drifter1987.github.io",
@@ -27,6 +37,7 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 
 let schemaReady = false;
+let lastCleanup = 0;
 let countryCache = null;
 let smsHealth = {
   provider: "receive-sms.io",
@@ -133,8 +144,136 @@ async function ensureSchema(db) {
         updated_at REAL NOT NULL
       )`,
     ),
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS rate_limits (
+        client_id TEXT NOT NULL,
+        bucket TEXT NOT NULL,
+        window_start INTEGER NOT NULL,
+        count INTEGER NOT NULL,
+        PRIMARY KEY (client_id, bucket, window_start)
+      )`,
+    ),
   ]);
   schemaReady = true;
+}
+
+// Fixed windows are enough here: they cost one small D1 row per client and
+// bucket, survive isolate restarts, and stay shared across every colo.
+const RATE_RULES = {
+  read: [
+    { bucket: "api-minute", window: MINUTE, max: 240 },
+    { bucket: "read-minute", window: MINUTE, max: 180 },
+  ],
+  write: [
+    { bucket: "api-minute", window: MINUTE, max: 240 },
+    { bucket: "write-minute", window: MINUTE, max: 40 },
+  ],
+  mailCreate: [
+    { bucket: "api-minute", window: MINUTE, max: 240 },
+    { bucket: "write-minute", window: MINUTE, max: 40 },
+    { bucket: "mail-create-ten", window: 10 * MINUTE, max: 6 },
+    { bucket: "mail-create-day", window: DAY, max: 30 },
+  ],
+  smsCreate: [
+    { bucket: "api-minute", window: MINUTE, max: 240 },
+    { bucket: "write-minute", window: MINUTE, max: 40 },
+    { bucket: "sms-create-ten", window: 10 * MINUTE, max: 6 },
+    { bucket: "sms-create-day", window: DAY, max: 30 },
+  ],
+};
+
+// Site-wide ceilings on the calls that spend shared provider quota. The client
+// id is caller-supplied, so per-client limits alone are not enough.
+const GLOBAL_CREATE_CAPS = {
+  mailCreate: { bucket: "global-mail-day", window: DAY, max: 300 },
+  smsCreate: { bucket: "global-sms-day", window: DAY, max: 200 },
+};
+
+function limitKind(method, sub) {
+  if (method === "POST" && sub === "/api/mail/api/inboxes") return "mailCreate";
+  if (method === "POST" && sub === "/api/sms/api/numbers") return "smsCreate";
+  return method === "GET" || method === "HEAD" ? "read" : "write";
+}
+
+function windowStart(window) {
+  return Math.floor(now() / window) * window;
+}
+
+async function bumpCounter(db, client, bucket, window) {
+  const start = windowStart(window);
+  // D1 does not surface the `RETURNING` row through .first() on a write, so
+  // increment atomically and read the fresh count back explicitly.
+  await db
+    .prepare(
+      `INSERT INTO rate_limits (client_id, bucket, window_start, count)
+       VALUES (?, ?, ?, 1)
+       ON CONFLICT(client_id, bucket, window_start) DO UPDATE SET count = count + 1`,
+    )
+    .bind(client, bucket, start)
+    .run();
+  const row = await db
+    .prepare(
+      "SELECT count FROM rate_limits WHERE client_id = ? AND bucket = ? AND window_start = ?",
+    )
+    .bind(client, bucket, start)
+    .first();
+  return { count: Number(row?.count ?? 1), resetAt: start + window };
+}
+
+function retrySeconds(resetAt) {
+  return Math.max(1, Math.ceil((resetAt - now()) / 1000));
+}
+
+async function rateLimitHit(db, client, kind) {
+  for (const rule of RATE_RULES[kind] || RATE_RULES.read) {
+    const used = await bumpCounter(db, client, rule.bucket, rule.window);
+    if (used.count > rule.max) {
+      return {
+        code: "rate_limited",
+        limit: rule.max,
+        retry_after: retrySeconds(used.resetAt),
+        window_seconds: rule.window / 1000,
+      };
+    }
+  }
+  const cap = GLOBAL_CREATE_CAPS[kind];
+  if (cap) {
+    // "~site" cannot collide with a real client id, which is [A-Za-z0-9_-].
+    const used = await bumpCounter(db, "~site", cap.bucket, cap.window);
+    if (used.count > cap.max) {
+      return {
+        code: "service_limit",
+        limit: cap.max,
+        retry_after: retrySeconds(used.resetAt),
+        window_seconds: cap.window / 1000,
+      };
+    }
+  }
+  return null;
+}
+
+function limited(origin, hit) {
+  const message =
+    hit.code === "service_limit"
+      ? `The shared provider quota is used up for today. Try again in ${hit.retry_after} seconds.`
+      : `Too many requests from this browser. Try again in ${hit.retry_after} seconds.`;
+  return json(
+    429,
+    { error: message, ...hit },
+    origin,
+    { "Retry-After": String(hit.retry_after) },
+  );
+}
+
+async function pruneExpired(db) {
+  if (now() - lastCleanup < CLEANUP_INTERVAL_MS) return;
+  lastCleanup = now();
+  const cutoff = now();
+  await db.batch([
+    db.prepare("DELETE FROM rate_limits WHERE window_start < ?").bind(cutoff - 2 * DAY),
+    db.prepare("DELETE FROM mail_inboxes WHERE expires_at <= ?").bind(cutoff),
+    db.prepare("DELETE FROM sms_numbers WHERE expires_at <= ?").bind(cutoff),
+  ]);
 }
 
 function randomHex(bytes) {
@@ -535,6 +674,24 @@ async function mailRoute(request, sub, url, env, origin, client) {
     } catch {
       parsed = {};
     }
+    const held = await mailInboxRows(env.DB, client);
+    if (held.length >= MAX_MAIL_INBOXES) {
+      const retry = Math.max(
+        1,
+        Math.ceil((Math.min(...held.map((row) => row.expires_at)) - now()) / 1000),
+      );
+      return json(
+        429,
+        {
+          error: `This browser already holds ${held.length} hosted inboxes (limit ${MAX_MAIL_INBOXES}). Delete one, or wait for the oldest to expire.`,
+          code: "inbox_limit",
+          limit: MAX_MAIL_INBOXES,
+          retry_after: retry,
+        },
+        origin,
+        { "Retry-After": String(retry) },
+      );
+    }
     // Older cached pages may still ask for Mail.tm; the hosted API has no such
     // provider, so any provider value resolves to Guerrilla Mail.
     const created = await createMailInbox(env.DB, client);
@@ -895,6 +1052,23 @@ async function smsRoute(request, sub, url, env, origin, client) {
     const rows = await smsRows(env.DB, client);
     const existing = rows.find((row) => row.e164 === e164);
     if (existing) return json(200, { id: existing.id, e164: existing.e164 }, origin);
+    if (rows.length >= MAX_SMS_NUMBERS) {
+      const retry = Math.max(
+        1,
+        Math.ceil((Math.min(...rows.map((row) => row.expires_at)) - now()) / 1000),
+      );
+      return json(
+        429,
+        {
+          error: `This browser already watches ${rows.length} numbers (limit ${MAX_SMS_NUMBERS}). Remove one, or wait for the oldest to expire.`,
+          code: "number_limit",
+          limit: MAX_SMS_NUMBERS,
+          retry_after: retry,
+        },
+        origin,
+        { "Retry-After": String(retry) },
+      );
+    }
     const id = randomHex(20);
     const createdAt = now();
     await env.DB.prepare(
@@ -1098,6 +1272,21 @@ export default {
     const sub = url.pathname.replace(/\/+$/, "") || "/";
 
     try {
+      // Oversized bodies are rejected before JSON parsing or any D1 write.
+      if (
+        request.method !== "GET" &&
+        request.method !== "HEAD" &&
+        Number(request.headers.get("content-length") || 0) > MAX_JSON_BYTES
+      ) {
+        return json(
+          413,
+          { error: "Request body is too large", code: "payload_too_large" },
+          origin,
+        );
+      }
+      await pruneExpired(env.DB);
+      const hit = await rateLimitHit(env.DB, client, limitKind(request.method, sub));
+      if (hit) return limited(origin, hit);
       if (sub === "/api/status") {
         const mail = await env.DB.prepare("SELECT COUNT(*) AS count FROM mail_inboxes WHERE client_id = ? AND expires_at > ?")
           .bind(client, now())
