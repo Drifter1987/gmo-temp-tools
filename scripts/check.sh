@@ -66,7 +66,20 @@ else
   exit 1
 fi
 echo
-
+echo "== hosted worker unit tests =="
+printf '%-14s ' "worker"
+if ( cd "$ROOT" && npm run test:worker --silent >"$WORK/worker.log" 2>&1 ); then
+  # Node's test reporter prints TAP (# pass N) or the spec summary (pass N)
+  # depending on version and whether stdout is a TTY.
+  passed=$(grep -oE '(# pass|pass) [0-9]+' "$WORK/worker.log" | grep -oE '[0-9]+' | tail -1)
+  echo "${passed:-0} passed"
+else
+  echo "FAILED"
+  echo
+  tail -40 "$WORK/worker.log"
+  exit 1
+fi
+echo
 echo "== unit tests (warnings are errors) =="
 FAILED=0
 for crate in webhook-sign local-auth desktop-notifications temp-ui temp-email temp-sms temp-otp; do

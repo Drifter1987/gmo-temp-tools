@@ -259,6 +259,32 @@ suite covers Mail, SMS, OTP and Settings through the real local web app.
 The app must be running (`./scripts/run-all.sh`) for Playwright; the Rust
 integration tests start their own transient listeners.
 
+### Hosted API tests
+
+The hosted worker has unit tests that run against a D1-shaped adapter backed by
+Node's built-in SQLite, so its real SQL runs without a Cloudflare account:
+
+```bash
+npm run test:worker
+```
+
+They cover the in-memory read burst window, the durable six-per-ten-minutes
+creation window, the five-inbox cap, provider fallback and health recording,
+Guerrilla and TempMail.ai message mapping, deletion, and the all-providers-down
+response. `./scripts/check.sh` runs them with the other checks.
+
+The deployed build has a live smoke test that creates and deletes one inbox:
+
+```bash
+npm run smoke:hosted
+TEMPTOOLS_PAGES_URL=... TEMPTOOLS_API_BASE=... npm run smoke:hosted
+```
+
+It checks that the Pages bundle points at the API, reads the health snapshot,
+creates an inbox, lists its messages, deletes it and confirms it is gone. It
+needs network access, spends one provider inbox, and deletes the inbox even
+when an assertion fails.
+
 ## Honest limits
 
 - GitHub Pages hosts only the static UI. The hosted API is a separate service;
