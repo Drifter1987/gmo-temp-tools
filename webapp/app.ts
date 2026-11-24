@@ -6,7 +6,7 @@
 (() => {
   type Screen = "mail" | "sms" | "otp" | "settings";
 
-  interface ApiError { error?: string }
+  interface ApiError { error?: string; code?: string; retry_after?: number; limit?: number }
   interface Provider { id: string; label: string; address_rule?: string; inboxes?: number }
   interface ProviderHealth {
     provider: string;
@@ -93,6 +93,7 @@
     webhook?: WebhookStatus;
     webhook_configured?: boolean;
     numbers?: number;
+    limits?: { inboxes?: number; numbers?: number };
   }
   interface OtpSecret {
     index: number;
@@ -158,6 +159,7 @@
     messages: [] as MailMessage[],
     detail: null as MailDetail | null,
     provider: WEB ? "guerrilla" : "mail.tm",
+    limit: 0,
   };
   const sms = {
     numbers: [] as SmsNumber[],
@@ -169,6 +171,7 @@
     country: "",
     available: [] as string[],
     chosen: "",
+    limit: 0,
   };
   const otp = {
     tab: "extract" as "extract" | "generate",
@@ -405,7 +408,10 @@
     });
     const data = await readJson<T & ApiError>(response);
     if (!response.ok) {
-      throw new Error(data?.error ?? `Request failed (${response.status})`);
+      const error = new Error(data?.error ?? `Request failed (${response.status})`) as Error & { code?: string; retry_after?: number };
+      error.code = data?.code;
+      error.retry_after = data?.retry_after;
+      throw error;
     }
     return data as T;
   }
@@ -424,6 +430,24 @@
 
   function ttlSpan(expires: number): string {
     return `<span data-ttl data-expires="${expires}">${esc(ttl(expires))}</span>`;
+  }
+
+  // The hosted API caps how many temporary resources one browser may hold. Show
+  // that cap with the time until the oldest slot frees, instead of letting a
+  // raw 429 be the first hint.
+  function capState(items: { expires_at: number }[], limit: number): { full: boolean; html: string } {
+    if (!WEB || limit <= 0 || items.length < limit) return { full: false, html: "" };
+    const soonest = Math.min(...items.map((item) => item.expires_at));
+    return {
+      full: true,
+      html: `${items.length} of ${limit} in use — oldest slot: ${ttlSpan(soonest)}. Delete one to free a slot now.`,
+    };
+  }
+
+  function capMessage(items: { expires_at: number }[], limit: number, noun: string): string {
+    if (limit <= 0) return `This browser has reached its ${noun} limit. Delete one to make room.`;
+    const soonest = Math.min(...items.map((item) => item.expires_at));
+    return `All ${limit} ${noun} are in use. Oldest slot: ${ttl(soonest)}. Delete one to make room.`;
   }
 
   function show(screen: Screen): void {
@@ -453,11 +477,12 @@
         <div class="intro-actions">
           <span class="chip live">live mail</span>
           <select class="select" id="mail-provider" aria-label="Mail provider"></select>
-          <button class="btn primary" data-action="mail-new">New inbox</button>
+          <button class="btn primary" id="mail-new" data-action="mail-new">New inbox</button>
         </div>
       </section>
       <p class="note">Each inbox is fetched from the provider you chose when creating it and kept ${WEB ? "by the hosted API" : "locally"} for one hour.</p>
       <p class="muted small" id="mail-provider-note"></p>
+      <p class="note" id="mail-cap" hidden></p>
       <p class="muted small" id="mail-health"></p>
       <div class="split">
         <div class="split-list" id="mail-list"><div class="pad muted">No inboxes loaded.</div></div>
@@ -505,6 +530,7 @@
       ]);
       if (token !== renderToken || current !== "mail") return;
       mail.providers = status.providers ?? [];
+      mail.limit = status.limits?.inboxes ?? 0;
       mail.healthUnavailable = !acceptance?.provider_health;
       if (acceptance?.provider_health) mail.health = acceptance.provider_health;
       mail.inboxes = list.inboxes ?? [];
@@ -542,6 +568,17 @@
     const rule = GmoUI.$<HTMLElement>("#mail-provider-note");
     if (rule) {
       rule.textContent = selected?.address_rule ? `Address rule: ${selected.address_rule}` : "";
+    }
+    const cap = capState(mail.inboxes, mail.limit);
+    const capNote = GmoUI.$<HTMLElement>("#mail-cap");
+    if (capNote) {
+      capNote.hidden = !cap.full;
+      capNote.innerHTML = cap.html;
+    }
+    const newInbox = GmoUI.$<HTMLButtonElement>("#mail-new");
+    if (newInbox) {
+      newInbox.disabled = cap.full;
+      newInbox.title = cap.full ? "Delete an inbox before creating another" : "";
     }
     const health = GmoUI.$<HTMLElement>("#mail-health");
     if (health) {
@@ -698,9 +735,14 @@
       mail.selected = created.id;
       await loadMail(renderToken);
     } catch (error) {
-      fail(error);
+      if ((error as { code?: string }).code === "inbox_limit") {
+        paintMail();
+        toast(capMessage(mail.inboxes, mail.limit, "inboxes"));
+      } else {
+        fail(error);
+      }
     } finally {
-      (button as HTMLButtonElement).disabled = false;
+      (button as HTMLButtonElement).disabled = capState(mail.inboxes, mail.limit).full;
       button.removeAttribute("aria-busy");
     }
   }
@@ -736,9 +778,10 @@
       <form class="panel panel-form" id="sms-picker">
         <div class="panel-row"><label for="sms-country">Country</label><select class="select" id="sms-country"></select></div>
         <div class="panel-row"><label for="sms-number">Public number</label><select class="select" id="sms-number"></select></div>
-        <div class="panel-row"><span></span><span class="row"><button class="btn" type="button" data-action="sms-check">Check source</button><button class="btn primary" type="submit">Add selected number</button></span></div>
+        <div class="panel-row"><span></span><span class="row"><button class="btn" type="button" data-action="sms-check">Check source</button><button class="btn primary" id="sms-add" type="submit">Add selected number</button></span></div>
       </form>
       <p class="muted small" id="sms-source">Checking receive-sms.io…</p>
+      <p class="note" id="sms-cap" hidden></p>
       <div class="split">
         <div class="split-list" id="sms-list"><div class="pad muted">No numbers loaded.</div></div>
         <div class="split-main" id="sms-thread"><div class="empty-reading"><p class="muted">Select a number to read its texts.</p></div></div>
@@ -760,6 +803,7 @@
       ]);
       if (token !== renderToken || current !== "sms") return;
       sms.status = status;
+      sms.limit = status.limits?.numbers ?? 0;
       sms.numbers = list.numbers ?? [];
       if (catalog?.countries) sms.countries = catalog.countries;
       preferSmsHealth(catalog?.source_health);
@@ -867,6 +911,17 @@
               </button>`,
             )
             .join("");
+    }
+    const cap = capState(sms.numbers, sms.limit);
+    const capNote = GmoUI.$<HTMLElement>("#sms-cap");
+    if (capNote) {
+      capNote.hidden = !cap.full;
+      capNote.innerHTML = cap.html;
+    }
+    const addNumber = GmoUI.$<HTMLButtonElement>("#sms-add");
+    if (addNumber) {
+      addNumber.disabled = cap.full;
+      addNumber.title = cap.full ? "Remove a number before adding another" : "";
     }
     paintSmsPicker();
     paintSmsThread();
@@ -982,9 +1037,14 @@
       await loadSms(renderToken);
       void loadSmsMessages(true);
     } catch (error) {
-      fail(error);
+      if ((error as { code?: string }).code === "number_limit") {
+        paintSms();
+        toast(capMessage(sms.numbers, sms.limit, "numbers"));
+      } else {
+        fail(error);
+      }
     } finally {
-      button.disabled = false;
+      button.disabled = capState(sms.numbers, sms.limit).full;
     }
   }
 
