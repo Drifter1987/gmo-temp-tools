@@ -1512,7 +1512,10 @@
       void loadSmsNumbers();
     }
     if (target.id === "sms-number") sms.chosen = target.value;
-    if (target.id === "mail-provider") mail.provider = target.value;
+    if (target.id === "mail-provider") {
+      mail.provider = target.value;
+      paintMail();
+    }
     if (target.id === "appearance" && (target.value === "dark" || target.value === "light")) {
       void changeAppearance(target.value);
     }
