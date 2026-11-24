@@ -970,7 +970,7 @@
         <button class="otp-tab ${otp.tab === "generate" ? "on" : ""}" data-action="otp-tab" data-tab="generate">Authenticator</button>
       </div>
       <div id="otp-body"></div>
-              <details class="guide"><summary>Security model</summary><p>${WEB ? "Secrets never leave this browser. They are stored in localStorage without the desktop app's DPAPI encryption, so use this browser profile carefully and keep another copy of any 2FA secret you cannot afford to lose." : "Secrets never leave this machine. On Windows the vault is encrypted at rest with DPAPI for your Windows user and writes are serialized with the desktop tab. Do not use this as your only copy of an account's 2FA secret."}</p></details>`;
+              <details class="guide"><summary>Security model</summary><p>${WEB ? "Secrets never leave this browser. They are stored in localStorage without the desktop app's DPAPI encryption, so use this browser profile carefully and keep another encrypted backup of any 2FA secret you cannot afford to lose — clearing site data or switching browsers otherwise loses the vault." : "Secrets never leave this machine. On Windows the vault is encrypted at rest with DPAPI for your Windows user and writes are serialized with the desktop tab. Do not use this as your only copy of an account's 2FA secret."}</p></details>`;
         if (otp.tab === "extract") {
             paintOtpExtract();
             void loadOtp(token);
@@ -1001,8 +1001,121 @@
       <div class="panel-row"><label for="otp-label">Label (optional)</label><input class="input" id="otp-label" value="${esc(otp.label)}" placeholder="Work account"></div>
       <div class="panel-row"><span></span><button class="btn primary" type="submit">Add account</button></div>
     </form>
-    <div id="otp-secrets"></div>`;
+    <div id="otp-secrets"></div>
+    ${WEB ? otpBackupPanel() : ""}`;
         paintOtpSecrets();
+    }
+    function otpBackupPanel() {
+        return `<div class="panel" id="otp-backup">
+      <div class="row-between"><strong>Encrypted backup</strong><span class="chip">client-side</span></div>
+      <p class="muted small">Export a passphrase-encrypted file before clearing site data or switching browsers. Encryption (PBKDF2 + AES-GCM) runs here; the passphrase and the backup never leave this browser. Without the passphrase the file cannot be opened.</p>
+      <div class="panel-row"><label for="otp-export-pass">Export passphrase</label><input class="input" id="otp-export-pass" type="password" autocomplete="new-password" placeholder="At least 8 characters"></div>
+      <div class="panel-row"><label for="otp-export-confirm">Confirm passphrase</label><input class="input" id="otp-export-confirm" type="password" autocomplete="new-password"></div>
+      <div class="panel-row"><span></span><button class="btn" data-action="otp-export">Download encrypted backup</button></div>
+      <div class="panel-row"><label for="otp-import-file">Restore from file</label><input class="input" id="otp-import-file" type="file" accept="application/json,.json"></div>
+      <label class="label" for="otp-import-text">or paste the backup JSON</label>
+      <textarea class="textarea" id="otp-import-text" placeholder="Paste the contents of a gmo-temptools OTP backup file"></textarea>
+      <div class="panel-row"><label for="otp-import-pass">Restore passphrase</label><input class="input" id="otp-import-pass" type="password" autocomplete="current-password"></div>
+      <div class="panel-row"><span></span><button class="btn" data-action="otp-import">Import and merge</button></div>
+      <p class="muted small" id="otp-backup-status" role="status"></p>
+    </div>`;
+    }
+    function setBackupStatus(text) {
+        const status = GmoUI.$("#otp-backup-status");
+        if (status)
+            status.textContent = text;
+    }
+    async function exportOtpVault() {
+        if (!WEB)
+            return;
+        const pass = GmoUI.$("#otp-export-pass")?.value ?? "";
+        const confirmation = GmoUI.$("#otp-export-confirm")?.value ?? "";
+        if (pass !== confirmation) {
+            setBackupStatus("The two passphrases do not match.");
+            return;
+        }
+        try {
+            const backup = await GmoUI.encryptOtpBackup(loadLocalSecrets(), pass);
+            const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = `gmo-temptools-otp-backup-${new Date().toISOString().slice(0, 10)}.json`;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+            const passInput = GmoUI.$("#otp-export-pass");
+            const confirmInput = GmoUI.$("#otp-export-confirm");
+            if (passInput)
+                passInput.value = "";
+            if (confirmInput)
+                confirmInput.value = "";
+            setBackupStatus(`Encrypted backup of ${backup.count} account(s) downloaded. Keep the passphrase safe; it cannot be recovered.`);
+            toast("Encrypted backup downloaded.");
+        }
+        catch (error) {
+            setBackupStatus(error instanceof Error ? error.message : String(error));
+        }
+    }
+    async function importOtpVault() {
+        if (!WEB)
+            return;
+        const pass = GmoUI.$("#otp-import-pass")?.value ?? "";
+        const fileInput = GmoUI.$("#otp-import-file");
+        const file = fileInput?.files?.[0] ?? null;
+        const pasted = GmoUI.$("#otp-import-text")?.value.trim() ?? "";
+        try {
+            let text = pasted;
+            if (file) {
+                if (file.size > 2 * 1024 * 1024)
+                    throw new Error("That backup file is too large.");
+                text = await file.text();
+            }
+            if (!text)
+                throw new Error("Choose a backup file or paste its JSON first.");
+            let payload;
+            try {
+                payload = JSON.parse(text);
+            }
+            catch {
+                throw new Error("That backup is not valid JSON.");
+            }
+            const incoming = await GmoUI.decryptOtpBackup(payload, pass);
+            const secrets = loadLocalSecrets();
+            let added = 0;
+            let present = 0;
+            for (const secret of incoming) {
+                if (secrets.some((item) => item.secret === secret.secret && item.label === secret.label)) {
+                    present += 1;
+                    continue;
+                }
+                if (secrets.length >= GmoUI.OTP_BACKUP_MAX_SECRETS)
+                    break;
+                secrets.push(secret);
+                added += 1;
+            }
+            if (added > 0)
+                saveLocalSecrets(secrets);
+            if (fileInput)
+                fileInput.value = "";
+            const textInput = GmoUI.$("#otp-import-text");
+            if (textInput)
+                textInput.value = "";
+            const passInput = GmoUI.$("#otp-import-pass");
+            if (passInput)
+                passInput.value = "";
+            if (added > 0)
+                await loadOtp(renderToken);
+            setBackupStatus(added === 0
+                ? `No new accounts imported; ${present} already present.`
+                : `Imported ${added} account(s)${present > 0 ? `; ${present} already present` : ""}.`);
+            if (added > 0)
+                toast(`Imported ${added} authenticator account(s).`);
+        }
+        catch (error) {
+            setBackupStatus(error instanceof Error ? error.message : String(error));
+        }
     }
     function renderFound() {
         if (!otp.found || (otp.found.codes.length === 0 && otp.found.links.length === 0)) {
@@ -1375,7 +1488,12 @@
                     return;
                 await api(`/api/otp/${index}`, { method: "DELETE" }).catch(() => null);
                 await loadOtp(renderToken);
+                return;
             }
+            if (action === "otp-export")
+                return exportOtpVault();
+            if (action === "otp-import")
+                return importOtpVault();
         }
     }
     app.addEventListener("click", (event) => {

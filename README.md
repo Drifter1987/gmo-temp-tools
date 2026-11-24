@@ -43,6 +43,17 @@ polling traffic does not spend the write budget.
 The Mail tab shows each provider's current state and when it was last checked;
 the SMS tab shows the source status and its last success time.
 
+### OTP vault backup
+
+The hosted OTP vault lives only in this browser's `localStorage`. **OTP →
+Authenticator → Encrypted backup** exports it as a JSON file encrypted with
+PBKDF2-SHA-256 (310,000 iterations) and AES-256-GCM under a passphrase you
+choose; the same panel imports that file, or its pasted JSON, back into this or
+another browser and merges accounts that are not already present. Encryption
+and decryption run in the page with WebCrypto: the passphrase and the ciphertext
+are never sent to the API, and the passphrase is never stored. There is no
+recovery, so a forgotten passphrase means the backup cannot be opened.
+
 The hosted build has no account system. A random browser client ID scopes the
 Mail/SMS metadata stored in D1, and **Settings → Clear all data** removes it.
 Do not treat public temporary inboxes as private. Mailbox contents and upstream
@@ -270,5 +281,9 @@ integration tests start their own transient listeners.
   over 8 KiB are rejected with `413`.
 - Carrier signature checks are tested with locally generated keys, not live
   carrier traffic.
+- The hosted OTP vault exists only in this browser's `localStorage`. Its encrypted
+  backup protects the file if it is copied elsewhere, but the backup is only as
+  strong as the passphrase, and a lost passphrase cannot be recovered. Clearing
+  site data without exporting a backup still loses the vault.
 - The app is local-only by design. It is not a remote account system, and the
   installation key is not a substitute for one.
