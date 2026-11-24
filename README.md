@@ -18,10 +18,12 @@ the repository is renamed from `gmo-temp-email`).
 GitHub Pages only serves static files, so the Rust desktop process cannot run
 there. The hosted Mail/SMS API in `server/worker.js` runs on Freebuff Sites with
 D1 storage, fetches upstream providers server-side (avoiding browser CORS), and
-allows only the Pages origin. The hosted Mail API uses Guerrilla Mail only:
-Mail.tm rejects requests from the serverless host, so the web build does not
-offer it (the desktop app still supports Mail.tm). OTP extraction and the TOTP
-authenticator remain entirely in the browser and never call the API.
+allows only the Pages origin. The hosted Mail API offers Guerrilla Mail,
+Best-TempMail and TempMail.ai, tries the provider you pick first and falls back
+to the other two. Mail.tm and Maildrop are rejected by their edges from this
+host, so the web build does not offer them (the desktop app still supports
+Mail.tm). OTP extraction and the TOTP authenticator remain entirely in the
+browser and never call the API.
 
 The hosted build has no account system. A random browser client ID scopes the
 Mail/SMS metadata stored in D1, and **Settings → Clear all data** removes it.
@@ -30,7 +32,7 @@ provider availability are outside this app's control.
 
 | Tab | What it does | Data source | Local API |
 |---|---|---|---|
-| **Mail** | Creates disposable addresses and shows their inboxes | Mail.tm in the desktop app; Guerrilla Mail in the hosted web API | 8781 |
+| **Mail** | Creates disposable addresses and shows their inboxes | Mail.tm in the desktop app; Guerrilla Mail, Best-TempMail and TempMail.ai in the hosted web API | 8781 |
 | **SMS (Beta)** | Browses public numbers by country and reads received texts | receive-sms.io public pages | 8782 |
 | **OTP** | Extracts codes offline and runs a TOTP authenticator | none — stays local | — |
 | **Settings** | Appearance, notifications, hosted access, release notes and cleanup | local files or hosted D1 | 8780 |
@@ -233,9 +235,10 @@ integration tests start their own transient listeners.
 - GitHub Pages hosts only the static UI. The hosted API is a separate service;
   the Rust desktop app is not available at the Pages URL.
 - Upstream mail and SMS services are not ours. Rate limits and missing public
-  numbers are reported, not replaced with invented data. Mail.tm answers the
-  desktop app but returns 403 to the hosted API, so the web build offers
-  Guerrilla Mail only; Mail.tm remains available in the desktop app.
+  numbers are reported, not replaced with invented data. Mail.tm and Maildrop
+  answer the desktop but return 403 to the hosted API, so the web build relies
+  on Guerrilla Mail, Best-TempMail and TempMail.ai; if the selected provider is
+  down the API falls back to the other two and labels the fallback.
 - The hosted web build is not an account system. Its client ID is not a
   password, and public SMS inboxes are shared with anyone who opens the same
   page; upstream availability varies. SMS is therefore labelled **Beta**.

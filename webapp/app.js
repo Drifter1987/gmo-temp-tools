@@ -350,7 +350,7 @@
           <li>The verification mail arrives here; the code is pulled out automatically.</li>
           <li>Inboxes and their mail are deleted an hour after creation.</li>
           ${WEB
-            ? "<li>Some senders block disposable domains. The hosted API offers Guerrilla Mail, the provider it can reach; the desktop app adds Mail.tm.</li>"
+            ? "<li>Some senders block disposable domains. The hosted API offers Guerrilla Mail, Best-TempMail and TempMail.ai, and falls back automatically if one is down; the desktop app adds Mail.tm.</li>"
             : "<li>Some senders block disposable domains; switching provider is the practical workaround.</li>"}
         </ol>
         <p>No account is needed here. The message list is cached for a few seconds to stay inside provider free-tier limits.</p>

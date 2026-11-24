@@ -498,6 +498,88 @@ async function activeMailDomain() {
   return active.domain;
 }
 
+// Providers verified to answer from Cloudflare Workers. Maildrop and Mail.tm
+// sit behind edge challenges that reject this host, so they are not listed.
+const MAIL_PROVIDERS = [
+  {
+    id: "guerrilla",
+    label: "Guerrilla Mail",
+    address_rule: "provider-assigned Guerrilla domain",
+  },
+  {
+    id: "best-tempmail",
+    label: "Best-TempMail",
+    address_rule: "provider-assigned mailbox on a rotating domain",
+  },
+  {
+    id: "tempmail.ai",
+    label: "TempMail.ai",
+    address_rule: "provider-assigned mailbox on its public domains",
+  },
+];
+
+async function providerJson(label, url, init = {}) {
+  const headers = new Headers(init.headers || {});
+  headers.set("Accept", "application/json");
+  headers.set("User-Agent", SMS_AGENT);
+  if (init.token) headers.set("Authorization", `Bearer ${init.token}`);
+  if (init.body !== undefined) headers.set("Content-Type", "application/json");
+  const response = await fetch(url, {
+    method: init.method || (init.body !== undefined ? "POST" : "GET"),
+    headers,
+    body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
+    signal: AbortSignal.timeout(20_000),
+  });
+  const raw = await response.text();
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = null;
+  }
+  if (!response.ok) {
+    const detail =
+      data?.error?.message || data?.detail || data?.message || raw.slice(0, 140);
+    const error = new Error(
+      `${label} returned ${response.status}${detail ? `: ${detail}` : ""}`,
+    );
+    error.status = response.status;
+    throw error;
+  }
+  return data || {};
+}
+
+async function storeInbox(db, client, inbox) {
+  const id = randomHex(20);
+  const createdAt = now();
+  const expiresAt = createdAt + MAIL_TTL_MS;
+  await db
+    .prepare(
+      `INSERT INTO mail_inboxes
+        (id, client_id, address, provider, password, token, remote_id, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      id,
+      client,
+      inbox.address,
+      inbox.provider,
+      inbox.password || "",
+      inbox.token || "",
+      inbox.remoteId || "",
+      createdAt,
+      expiresAt,
+    )
+    .run();
+  return {
+    id,
+    address: inbox.address,
+    provider: inbox.provider,
+    created_at: createdAt,
+    expires_at: expiresAt,
+  };
+}
+
 async function guerrillaJson(path) {
   const response = await fetch(`https://api.guerrillamail.com/ajax.php?${path}`, {
     headers: { Accept: "application/json", "User-Agent": SMS_AGENT },
@@ -533,41 +615,80 @@ async function createGuerrillaInbox(db, client) {
   if (!created.email_addr || !created.sid_token) {
     throw new Error("Guerrilla Mail did not return an inbox");
   }
-  const id = randomHex(20);
-  const createdAt = now();
-  const expiresAt = createdAt + MAIL_TTL_MS;
-  await db
-    .prepare(
-      `INSERT INTO mail_inboxes
-        (id, client_id, address, provider, password, token, remote_id, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(
-      id,
-      client,
-      created.email_addr,
-      "guerrilla",
-      "",
-      created.sid_token,
-      "",
-      createdAt,
-      expiresAt,
-    )
-    .run();
-  return { id, address: created.email_addr, provider: "guerrilla", created_at: createdAt, expires_at: expiresAt };
+  return storeInbox(db, client, {
+    address: created.email_addr,
+    provider: "guerrilla",
+    token: created.sid_token,
+  });
 }
 
-async function createMailInbox(db, client) {
-  // One provider only: Guerrilla Mail is the only upstream this host can reach.
-  return createGuerrillaInbox(db, client);
+async function createBestTempMailInbox(db, client) {
+  const created = await providerJson(
+    "Best-TempMail",
+    "https://api.best-tempmail.com/v1/inboxes",
+    { body: {} },
+  );
+  if (!created.address) throw new Error("Best-TempMail did not return an address");
+  return storeInbox(db, client, { address: created.address, provider: "best-tempmail" });
+}
+
+async function createTempMailAiInbox(db, client) {
+  const account = await providerJson(
+    "TempMail.ai",
+    "https://www.tempmail.ai/api/v1/accounts",
+    { body: {} },
+  );
+  if (!account.address || !account.password) {
+    throw new Error("TempMail.ai did not return an account");
+  }
+  const auth = await providerJson(
+    "TempMail.ai",
+    "https://www.tempmail.ai/api/v1/token",
+    { body: { address: account.address, password: account.password } },
+  );
+  return storeInbox(db, client, {
+    address: account.address,
+    provider: "tempmail.ai",
+    password: account.password,
+    token: auth.token || "",
+    remoteId: account.id || "",
+  });
+}
+
+async function createMailInbox(db, client, requested = "guerrilla") {
+  const wanted = MAIL_PROVIDERS.some((provider) => provider.id === requested)
+    ? requested
+    : "guerrilla";
+  const order = [wanted, ...MAIL_PROVIDERS.map((provider) => provider.id).filter((id) => id !== wanted)];
+  const failures = [];
+  for (const provider of order) {
+    try {
+      if (provider === "best-tempmail") return await createBestTempMailInbox(db, client);
+      if (provider === "tempmail.ai") return await createTempMailAiInbox(db, client);
+      return await createGuerrillaInbox(db, client);
+    } catch (error) {
+      failures.push(`${provider}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(`Mail providers failed (${failures.join("; ")})`);
 }
 
 async function refreshMailToken(db, inbox) {
-  const auth = await mailTm("/token", {
-    method: "POST",
-    body: JSON.stringify({ address: inbox.address, password: inbox.password }),
-  });
-  const token = auth?.token || "";
+  let token = "";
+  if (inbox.provider === "tempmail.ai") {
+    const auth = await providerJson(
+      "TempMail.ai",
+      "https://www.tempmail.ai/api/v1/token",
+      { body: { address: inbox.address, password: inbox.password } },
+    );
+    token = auth?.token || "";
+  } else {
+    const auth = await mailTm("/token", {
+      method: "POST",
+      body: JSON.stringify({ address: inbox.address, password: inbox.password }),
+    });
+    token = auth?.token || "";
+  }
   inbox.token = token;
   await db
     .prepare("UPDATE mail_inboxes SET token = ? WHERE id = ?")
@@ -598,9 +719,86 @@ async function mailList(db, inbox) {
         String(message.subject).toLowerCase() === "welcome to guerrilla mail"
       ));
   }
+  if (inbox.provider === "best-tempmail") {
+    const data = await providerJson(
+      "Best-TempMail",
+      `https://api.best-tempmail.com/v1/inboxes/${encodeURIComponent(inbox.address)}/messages`,
+    );
+    return (Array.isArray(data.messages) ? data.messages : []).map((message) => ({
+      id: String(message.id || ""),
+      from: message.from || "",
+      subject: message.subject || "",
+      intro: message.preview || message.text || "",
+      seen: Boolean(message.seen),
+      createdAt: message.date || "",
+    }));
+  }
+  if (inbox.provider === "tempmail.ai") {
+    return withMailToken(db, inbox, async (token) => {
+      const data = await providerJson(
+        "TempMail.ai",
+        "https://www.tempmail.ai/api/v1/messages",
+        { token },
+      );
+      const items = data?.data?.items || data?.items || [];
+      return items.map((message) => ({
+        id: String(message.id || ""),
+        from: message.from || "",
+        subject: message.subject || "",
+        intro: message.preview || message.text || "",
+        seen: Boolean(message.seen),
+        createdAt: message.received_at || "",
+      }));
+    });
+  }
   return withMailToken(db, inbox, async (token) => {
     const data = await mailTm("/messages?page=1", {}, token);
     return data?.["hydra:member"] || data?.hydra?.member || [];
+  });
+}
+
+async function mailDetailFromProvider(db, inbox, id, remoteId) {
+  const data = await providerJson(
+    "Best-TempMail",
+    `https://api.best-tempmail.com/v1/inboxes/${encodeURIComponent(inbox.address)}/messages/${encodeURIComponent(remoteId)}`,
+  );
+  const message = data.message || data;
+  const htmlValue = typeof message.html === "string" ? message.html : "";
+  const plain = message.text || stripTags(htmlValue);
+  return {
+    id,
+    sender: sender(message.from),
+    subject: message.subject || "",
+    text: plain,
+    code: extractCode(`${plain} ${message.subject || ""}`),
+    link: extractLink(`${plain} ${htmlValue}`),
+    received_at: parseTime(message.date),
+    has_html: Boolean(htmlValue.trim()),
+  };
+}
+
+async function mailDetailFromTempMailAi(db, inbox, id) {
+  return withMailToken(db, inbox, async (token) => {
+    const data = await providerJson(
+      "TempMail.ai",
+      `https://www.tempmail.ai/api/v1/messages/${encodeURIComponent(String(id).split("~").slice(1).join("~"))}`,
+      { token },
+    );
+    const message = data?.data || data;
+    const htmlValue = typeof message.html === "string" ? message.html : "";
+    const plain = message.text || stripTags(htmlValue);
+    return {
+      id,
+      sender: sender(message.from),
+      subject: message.subject || "",
+      text: plain,
+      code:
+        message.verification_code ||
+        extractCode(`${plain} ${message.subject || ""}`),
+      link: extractLink(`${plain} ${htmlValue}`),
+      received_at: parseTime(message.received_at),
+      has_html: Boolean(htmlValue.trim()),
+    };
   });
 }
 
@@ -708,6 +906,12 @@ async function mailDetail(db, inbox, id) {
       has_html: isHtml,
     };
   }
+  if (inbox.provider === "best-tempmail") {
+    return mailDetailFromProvider(db, inbox, id, remoteId);
+  }
+  if (inbox.provider === "tempmail.ai") {
+    return mailDetailFromTempMailAi(db, inbox, id);
+  }
   const message = await withMailToken(db, inbox, async (token) =>
     mailTm(`/messages/${encodeURIComponent(remoteId)}`, {}, token),
   );
@@ -735,16 +939,12 @@ async function mailRoute(request, sub, url, env, origin, client) {
       200,
       {
         mode: "web",
-        providers: [
-          {
-            id: "guerrilla",
-            label: "Guerrilla Mail",
-            address_rule: "provider-assigned Guerrilla domain",
-            inboxes: rows.filter((row) => row.provider === "guerrilla").length,
-          },
-        ],
+        providers: MAIL_PROVIDERS.map((provider) => ({
+          ...provider,
+          inboxes: rows.filter((row) => row.provider === provider.id).length,
+        })),
         limits: { inboxes: MAX_MAIL_INBOXES },
-        provider_rule: "Guerrilla Mail, fetched server-side",
+        provider_rule: "server-side providers with automatic fallback",
       },
       origin,
     );
@@ -782,13 +982,14 @@ async function mailRoute(request, sub, url, env, origin, client) {
     }
     // Older cached pages may still ask for Mail.tm; the hosted API has no such
     // provider, so any provider value resolves to Guerrilla Mail.
-    const created = await createMailInbox(env.DB, client);
+    const requested = String(parsed?.provider || "guerrilla");
+    const created = await createMailInbox(env.DB, client, requested);
     return json(
       200,
       {
         ...created,
-        requested_provider: parsed?.provider || created.provider,
-        fallback: false,
+        requested_provider: requested,
+        fallback: created.provider !== requested,
       },
       origin,
     );
@@ -802,6 +1003,14 @@ async function mailRoute(request, sub, url, env, origin, client) {
     try {
       if (inbox.provider === "guerrilla") {
         await guerrillaJson(`f=forget_me&sid_token=${encodeURIComponent(inbox.token)}`);
+      } else if (inbox.provider === "best-tempmail") {
+        await providerJson(
+          "Best-TempMail",
+          `https://api.best-tempmail.com/v1/inboxes/${encodeURIComponent(inbox.address)}`,
+          { method: "DELETE" },
+        );
+      } else if (inbox.provider === "tempmail.ai") {
+        // TempMail.ai expires mailboxes on its own schedule and has no delete.
       } else {
         await withMailToken(env.DB, inbox, async (token) =>
           mailTm(`/accounts/${encodeURIComponent(inbox.remote_id)}`, { method: "DELETE" }, token),
@@ -835,6 +1044,23 @@ async function mailRoute(request, sub, url, env, origin, client) {
         `f=fetch_email&email_id=${encodeURIComponent(remoteId)}&sid_token=${encodeURIComponent(inbox.token)}`,
       );
       html = String(message.mail_body || "");
+    } else if (inbox.provider === "best-tempmail") {
+      const data = await providerJson(
+        "Best-TempMail",
+        `https://api.best-tempmail.com/v1/inboxes/${encodeURIComponent(inbox.address)}/messages/${encodeURIComponent(remoteId)}`,
+      );
+      const message = data.message || data;
+      html = typeof message.html === "string" ? message.html : "";
+    } else if (inbox.provider === "tempmail.ai") {
+      const data = await withMailToken(env.DB, inbox, async (token) =>
+        providerJson(
+          "TempMail.ai",
+          `https://www.tempmail.ai/api/v1/messages/${encodeURIComponent(remoteId)}`,
+          { token },
+        ),
+      );
+      const message = data?.data || data;
+      html = typeof message.html === "string" ? message.html : "";
     } else {
       const message = await withMailToken(env.DB, inbox, async (token) =>
         mailTm(`/messages/${encodeURIComponent(remoteId)}`, {}, token),
