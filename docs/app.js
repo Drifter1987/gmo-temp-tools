@@ -452,6 +452,15 @@
                     .sort((a, b) => b - a)[0];
                 health.textContent = `Providers responding · ${history.map((row) => `${row.provider}: ${row.create_failures} create / ${row.list_failures} list failures`).join(" · ")}${lastSuccess ? ` · last success ${new Date(lastSuccess).toLocaleTimeString()}` : ""}`;
             }
+            else if (mail.health.length > 0) {
+                const checked = mail.health
+                    .map((row) => row.last_attempt_at || 0)
+                    .sort((a, b) => b - a)[0];
+                const rows = mail.health
+                    .map((row) => `${row.provider}: ${row.error_is_current ? "failing" : "ok"}`)
+                    .join(" · ");
+                health.textContent = `Provider health · ${rows}${checked ? ` · checked ${ageLabel(checked)}` : ""}`;
+            }
             else {
                 health.textContent = "Provider health: no failures recorded yet.";
             }
@@ -615,6 +624,13 @@
     function numberLabel(digits) {
         return digits.startsWith("+") ? digits : `+${digits}`;
     }
+    function ageLabel(at) {
+        const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+        if (seconds < 90)
+            return "just now";
+        const minutes = Math.round(seconds / 60);
+        return minutes < 90 ? `${minutes}m ago` : `${Math.round(minutes / 60)}h ago`;
+    }
     function preferSmsHealth(next) {
         if (!next || !sms.status)
             return;
@@ -764,7 +780,10 @@
                 source.textContent = `Source ${health.status} · ${health.last_error}`;
             }
             else {
-                source.textContent = `Source ${health.status} · ${sms.countries.length} countries listed · public numbers are shared inboxes.`;
+                const lastOk = health.last_success_at
+                    ? ` Last ok ${new Date(health.last_success_at).toLocaleTimeString()}.`
+                    : "";
+                source.textContent = `Source ${health.status} · ${sms.countries.length} countries listed · public numbers are shared inboxes.${lastOk}`;
             }
         }
         const list = GmoUI.$("#sms-list");

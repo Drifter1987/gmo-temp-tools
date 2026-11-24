@@ -27,6 +27,21 @@ const MAX_MAIL_INBOXES = 5;
 const MAX_SMS_NUMBERS = 5;
 const MAX_JSON_BYTES = 8 * 1024;
 const CLEANUP_INTERVAL_MS = HOUR;
+
+// Upstream health is written to D1 only on transitions, a slow heartbeat, or an
+// explicit probe, so normal polling traffic never spends the write budget.
+const HEALTH_PROVIDERS = {
+  guerrilla: { kind: "mail", label: "Guerrilla Mail" },
+  "best-tempmail": { kind: "mail", label: "Best-TempMail" },
+  "tempmail.ai": { kind: "mail", label: "TempMail.ai" },
+  "receive-sms.io": { kind: "sms", label: "receive-sms.io" },
+};
+const HEALTH_STALE_MS = 30 * MINUTE;
+const HEALTH_FAILURE_WRITE_MS = 5 * MINUTE;
+const HEALTH_HEARTBEAT_MS = 6 * HOUR;
+const HEALTH_PROBE_MIN_INTERVAL_MS = 60 * 1000;
+const healthMemory = new Map();
+let lastHealthProbeAt = 0;
 const ALLOWED_ORIGINS = new Set([
   "https://drifter1987.github.io",
   "https://Drifter1987.github.io",
@@ -151,6 +166,18 @@ async function ensureSchema(db) {
         window_start INTEGER NOT NULL,
         count INTEGER NOT NULL,
         PRIMARY KEY (client_id, bucket, window_start)
+      )`,
+    ),
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS provider_health (
+        provider TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        consecutive_failures INTEGER NOT NULL,
+        last_error TEXT NOT NULL,
+        last_success_at INTEGER NOT NULL,
+        last_failure_at INTEGER NOT NULL,
+        last_attempt_at INTEGER NOT NULL
       )`,
     ),
   ]);
@@ -350,6 +377,155 @@ function limited(origin, hit) {
     origin,
     { "Retry-After": String(hit.retry_after) },
   );
+}
+
+async function recordHealth(db, provider, ok, error = "", force = false) {
+  const info = HEALTH_PROVIDERS[provider];
+  if (!db || !info) return;
+  const state = healthMemory.get(provider) || {};
+  const stamp = now();
+  try {
+    if (ok) {
+      if (!force && !state.failing && stamp - (state.lastSuccessWrite || 0) < HEALTH_HEARTBEAT_MS) return;
+      healthMemory.set(provider, { failing: false, lastSuccessWrite: stamp });
+      await db
+        .prepare(
+          `INSERT INTO provider_health
+            (provider, kind, status, consecutive_failures, last_error, last_success_at, last_failure_at, last_attempt_at)
+           VALUES (?, ?, 'ok', 0, '', ?, 0, ?)
+           ON CONFLICT(provider) DO UPDATE SET
+             status = 'ok',
+             consecutive_failures = 0,
+             last_success_at = excluded.last_success_at,
+             last_attempt_at = excluded.last_attempt_at`,
+        )
+        .bind(provider, info.kind, stamp, stamp)
+        .run();
+      return;
+    }
+    if (!force && state.failing && stamp - (state.lastFailureWrite || 0) < HEALTH_FAILURE_WRITE_MS) return;
+    healthMemory.set(provider, { failing: true, lastFailureWrite: stamp });
+    await db
+      .prepare(
+        `INSERT INTO provider_health
+          (provider, kind, status, consecutive_failures, last_error, last_success_at, last_failure_at, last_attempt_at)
+         VALUES (?, ?, 'error', 1, ?, 0, ?, ?)
+         ON CONFLICT(provider) DO UPDATE SET
+           status = 'error',
+           consecutive_failures = consecutive_failures + 1,
+           last_error = excluded.last_error,
+           last_failure_at = excluded.last_failure_at,
+           last_attempt_at = excluded.last_attempt_at`,
+      )
+      .bind(provider, info.kind, String(error || "provider error").slice(0, 240), stamp, stamp)
+      .run();
+  } catch {
+    // Health bookkeeping must never break the request it is observing.
+  }
+}
+
+async function withProviderHealth(db, provider, operation) {
+  try {
+    const result = await operation();
+    await recordHealth(db, provider, true);
+    return result;
+  } catch (error) {
+    await recordHealth(db, provider, false, error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+}
+
+const HEALTH_PROBES = {
+  guerrilla:
+    "https://api.guerrillamail.com/ajax.php?f=get_email_list&offset=0&sid_token=probe",
+  "best-tempmail":
+    "https://api.best-tempmail.com/v1/inboxes/probe@example.invalid/messages",
+  "tempmail.ai": "https://www.tempmail.ai/api/v1/messages",
+  "receive-sms.io": "https://receive-sms.io/",
+};
+
+async function probeProviders(db) {
+  if (now() - lastHealthProbeAt < HEALTH_PROBE_MIN_INTERVAL_MS) return false;
+  lastHealthProbeAt = now();
+  await Promise.all(
+    Object.entries(HEALTH_PROBES).map(async ([provider, url]) => {
+      try {
+        const response = await fetch(url, {
+          headers: {
+            Accept: provider === "receive-sms.io" ? "text/html" : "application/json",
+            "User-Agent": SMS_AGENT,
+          },
+          signal: AbortSignal.timeout(15_000),
+        });
+        // Any answer below 500 means the service is reachable; a 403 is an edge
+        // block, which is exactly the breakage this monitor exists to catch.
+        if (response.status === 403 || response.status >= 500) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        await recordHealth(db, provider, true, "", true);
+      } catch (error) {
+        await recordHealth(
+          db,
+          provider,
+          false,
+          error instanceof Error ? error.message : String(error),
+          true,
+        );
+      }
+    }),
+  );
+  return true;
+}
+
+async function healthSnapshot(db) {
+  const result = await db.prepare("SELECT * FROM provider_health").all();
+  const rows = result.results || [];
+  const providers = Object.entries(HEALTH_PROVIDERS).map(([provider, info]) => {
+    const row = rows.find((item) => item.provider === provider);
+    return {
+      provider,
+      label: info.label,
+      kind: info.kind,
+      status: row?.status || "unknown",
+      consecutive_failures: row?.consecutive_failures || 0,
+      last_error: row?.last_error || "",
+      last_success_at: row?.last_success_at || 0,
+      last_failure_at: row?.last_failure_at || 0,
+      last_attempt_at: row?.last_attempt_at || 0,
+    };
+  });
+  const newest = providers.reduce((max, provider) => Math.max(max, provider.last_attempt_at), 0);
+  return {
+    ok: providers.every((provider) => provider.status !== "error"),
+    stale: !newest || now() - newest > HEALTH_STALE_MS,
+    checked_at: newest,
+    age_seconds: newest ? Math.round((now() - newest) / 1000) : null,
+    providers,
+  };
+}
+
+async function smsHealthSnapshot(db) {
+  const row = await db
+    .prepare("SELECT * FROM provider_health WHERE provider = 'receive-sms.io'")
+    .first();
+  if (!row) return smsHealth;
+  return {
+    ...smsHealth,
+    status:
+      row.status === "error"
+        ? "error"
+        : smsHealth.status === "unknown"
+          ? "ok"
+          : smsHealth.status,
+    consecutive_failures: Math.max(
+      smsHealth.consecutive_failures || 0,
+      row.consecutive_failures || 0,
+    ),
+    last_error: row.status === "error" ? row.last_error : smsHealth.last_error,
+    last_success_at: Math.max(smsHealth.last_success_at || 0, row.last_success_at || 0),
+    last_failure_at: Math.max(smsHealth.last_failure_at || 0, row.last_failure_at || 0),
+    last_attempt_at: Math.max(smsHealth.last_attempt_at || 0, row.last_attempt_at || 0),
+  };
 }
 
 async function pruneExpired(db) {
@@ -663,9 +839,11 @@ async function createMailInbox(db, client, requested = "guerrilla") {
   const failures = [];
   for (const provider of order) {
     try {
-      if (provider === "best-tempmail") return await createBestTempMailInbox(db, client);
-      if (provider === "tempmail.ai") return await createTempMailAiInbox(db, client);
-      return await createGuerrillaInbox(db, client);
+      return await withProviderHealth(db, provider, () => {
+        if (provider === "best-tempmail") return createBestTempMailInbox(db, client);
+        if (provider === "tempmail.ai") return createTempMailAiInbox(db, client);
+        return createGuerrillaInbox(db, client);
+      });
     } catch (error) {
       failures.push(`${provider}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -835,7 +1013,7 @@ async function mailInboxesPayload(db, client) {
     rows.map(async (inbox) => {
       let messages = [];
       try {
-        messages = await mailList(db, inbox);
+        messages = await withProviderHealth(db, inbox.provider, () => mailList(db, inbox));
       } catch {
         // A provider outage must not hide the inbox itself.
       }
@@ -950,7 +1128,20 @@ async function mailRoute(request, sub, url, env, origin, client) {
     );
   }
   if (method === "GET" && sub === "/api/acceptance") {
-    return json(200, { provider_health: [] }, origin);
+    const result = await env.DB.prepare(
+      "SELECT * FROM provider_health WHERE kind = 'mail'",
+    ).all();
+    const provider_health = (result.results || []).map((row) => ({
+      provider: HEALTH_PROVIDERS[row.provider]?.label || row.provider,
+      list_failures: row.status === "error" ? Math.max(1, row.consecutive_failures || 1) : 0,
+      create_failures: 0,
+      last_error: row.status === "error" ? row.last_error : "",
+      last_create_error: "",
+      last_success_at: row.last_success_at || 0,
+      last_attempt_at: row.last_attempt_at || 0,
+      error_is_current: row.status === "error",
+    }));
+    return json(200, { provider_health }, origin);
   }
   if (method === "GET" && sub === "/api/inboxes") {
     return json(200, await mailInboxesPayload(env.DB, client), origin);
@@ -1028,7 +1219,9 @@ async function mailRoute(request, sub, url, env, origin, client) {
     const rows = await mailInboxRows(env.DB, client);
     const inbox = rows.find((row) => row.id === decodeURIComponent(messagesMatch[1]));
     if (!inbox) return json(404, { error: "Inbox not found" }, origin);
-    const messages = await mailList(env.DB, inbox);
+    const messages = await withProviderHealth(env.DB, inbox.provider, () =>
+      mailList(env.DB, inbox),
+    );
     return json(200, mailMessagesPayload(inbox, messages), origin);
   }
 
@@ -1039,33 +1232,39 @@ async function mailRoute(request, sub, url, env, origin, client) {
     if (!inbox) return json(404, { error: "Message not found" }, origin);
     const remoteId = decodeURIComponent(htmlMatch[1]).split("~").slice(1).join("~");
     let html = "";
-    if (inbox.provider === "guerrilla") {
-      const message = await guerrillaJson(
-        `f=fetch_email&email_id=${encodeURIComponent(remoteId)}&sid_token=${encodeURIComponent(inbox.token)}`,
-      );
-      html = String(message.mail_body || "");
-    } else if (inbox.provider === "best-tempmail") {
-      const data = await providerJson(
-        "Best-TempMail",
-        `https://api.best-tempmail.com/v1/inboxes/${encodeURIComponent(inbox.address)}/messages/${encodeURIComponent(remoteId)}`,
-      );
-      const message = data.message || data;
-      html = typeof message.html === "string" ? message.html : "";
-    } else if (inbox.provider === "tempmail.ai") {
-      const data = await withMailToken(env.DB, inbox, async (token) =>
-        providerJson(
-          "TempMail.ai",
-          `https://www.tempmail.ai/api/v1/messages/${encodeURIComponent(remoteId)}`,
-          { token },
-        ),
-      );
-      const message = data?.data || data;
-      html = typeof message.html === "string" ? message.html : "";
-    } else {
-      const message = await withMailToken(env.DB, inbox, async (token) =>
-        mailTm(`/messages/${encodeURIComponent(remoteId)}`, {}, token),
-      );
-      html = Array.isArray(message.html) ? message.html.join("\n") : message.html || "";
+    try {
+      if (inbox.provider === "guerrilla") {
+        const message = await guerrillaJson(
+          `f=fetch_email&email_id=${encodeURIComponent(remoteId)}&sid_token=${encodeURIComponent(inbox.token)}`,
+        );
+        html = String(message.mail_body || "");
+      } else if (inbox.provider === "best-tempmail") {
+        const data = await providerJson(
+          "Best-TempMail",
+          `https://api.best-tempmail.com/v1/inboxes/${encodeURIComponent(inbox.address)}/messages/${encodeURIComponent(remoteId)}`,
+        );
+        const message = data.message || data;
+        html = typeof message.html === "string" ? message.html : "";
+      } else if (inbox.provider === "tempmail.ai") {
+        const data = await withMailToken(env.DB, inbox, async (token) =>
+          providerJson(
+            "TempMail.ai",
+            `https://www.tempmail.ai/api/v1/messages/${encodeURIComponent(remoteId)}`,
+            { token },
+          ),
+        );
+        const message = data?.data || data;
+        html = typeof message.html === "string" ? message.html : "";
+      } else {
+        const message = await withMailToken(env.DB, inbox, async (token) =>
+          mailTm(`/messages/${encodeURIComponent(remoteId)}`, {}, token),
+        );
+        html = Array.isArray(message.html) ? message.html.join("\n") : message.html || "";
+      }
+      await recordHealth(env.DB, inbox.provider, true);
+    } catch (error) {
+      await recordHealth(env.DB, inbox.provider, false, String(error));
+      throw error;
     }
     return new Response(html, {
       status: 200,
@@ -1086,7 +1285,9 @@ async function mailRoute(request, sub, url, env, origin, client) {
     if (!inbox) return json(404, { error: "Message not found" }, origin);
     return json(
       200,
-      await mailDetail(env.DB, inbox, decodeURIComponent(detailMatch[1])),
+      await withProviderHealth(env.DB, inbox.provider, () =>
+        mailDetail(env.DB, inbox, decodeURIComponent(detailMatch[1])),
+      ),
       origin,
     );
   }
@@ -1282,7 +1483,7 @@ async function smsRoute(request, sub, url, env, origin, client) {
         provider: "receive-sms.io",
         numbers: rows.length,
         source: "public shared inboxes",
-        source_health: smsHealth,
+        source_health: await smsHealthSnapshot(env.DB),
         provider_rule: "live public page, then last-good cache",
         limits: { numbers: MAX_SMS_NUMBERS },
         fallback_order: ["live public page", "last good cache"],
@@ -1294,24 +1495,36 @@ async function smsRoute(request, sub, url, env, origin, client) {
   if (method === "GET" && sub === "/api/health") {
     return json(
       200,
-      { source: smsHealth, provider_rule: "live public page, then last-good cache" },
+      {
+        source: await smsHealthSnapshot(env.DB),
+        provider_rule: "live public page, then last-good cache",
+      },
       origin,
     );
   }
   if (method === "GET" && sub === "/api/countries") {
     try {
-      const countries = await smsCountriesList();
-      return json(200, { countries, source_health: smsHealth }, origin);
+      const countries = await withProviderHealth(env.DB, "receive-sms.io", () =>
+        smsCountriesList(),
+      );
+      return json(200, { countries, source_health: await smsHealthSnapshot(env.DB) }, origin);
     } catch (error) {
       return json(502, { error: String(error), source_health: smsHealth }, origin);
     }
   }
   if (method === "POST" && sub === "/api/source/check") {
     try {
-      const countries = await smsCountriesList(true);
+      const countries = await withProviderHealth(env.DB, "receive-sms.io", () =>
+        smsCountriesList(true),
+      );
       return json(
         200,
-        { ok: true, country_count: countries.length, countries, source_health: smsHealth },
+        {
+          ok: true,
+          country_count: countries.length,
+          countries,
+          source_health: await smsHealthSnapshot(env.DB),
+        },
         origin,
       );
     } catch (error) {
@@ -1323,10 +1536,17 @@ async function smsRoute(request, sub, url, env, origin, client) {
     const slug = decodeURIComponent(countryNumbers[1]);
     try {
       if (!/^[a-z-]+$/.test(slug)) return json(422, { error: "invalid country slug" }, origin);
-      const numbers = await smsNumbersForCountry(slug);
+      const numbers = await withProviderHealth(env.DB, "receive-sms.io", () =>
+        smsNumbersForCountry(slug),
+      );
       return json(
         200,
-        { country: slug, numbers, source: "public shared inboxes", source_health: smsHealth },
+        {
+          country: slug,
+          numbers,
+          source: "public shared inboxes",
+          source_health: await smsHealthSnapshot(env.DB),
+        },
         origin,
       );
     } catch (error) {
@@ -1411,7 +1631,9 @@ async function smsRoute(request, sub, url, env, origin, client) {
     if (!number) return json(404, { error: "Number not found" }, origin);
     let messages = [];
     try {
-      messages = await smsMessagesFor(number, url.searchParams.get("fresh") === "1");
+      messages = await withProviderHealth(env.DB, "receive-sms.io", () =>
+        smsMessagesFor(number, url.searchParams.get("fresh") === "1"),
+      );
     } catch (error) {
       return json(502, { error: String(error), source_health: smsHealth }, origin);
     }
@@ -1448,7 +1670,9 @@ async function smsRoute(request, sub, url, env, origin, client) {
     const number = rows.find((row) => rawId.startsWith(`${row.id}-`));
     if (!number) return json(404, { error: "Message not found" }, origin);
     try {
-      const messages = await smsMessagesFor(number);
+      const messages = await withProviderHealth(env.DB, "receive-sms.io", () =>
+        smsMessagesFor(number),
+      );
       const found = messages.find((message, index) => smsMessageId(number, message, index) === rawId);
       if (!found) return json(404, { error: "Message not found" }, origin);
       return json(
@@ -1602,6 +1826,19 @@ export default {
       await pruneExpired(env.DB);
       const hit = await rateLimitHit(env.DB, client, limitKind(request.method, sub));
       if (hit) return limited(origin, hit);
+      // Public snapshot for the app; /api/health/check also probes upstreams and
+      // answers 503 when one is failing, so a pinger can alert on it.
+      if (sub === "/api/health") {
+        return json(200, await healthSnapshot(env.DB), origin);
+      }
+      if (sub === "/api/health/check") {
+        if (env.HEALTH_TOKEN && url.searchParams.get("token") !== env.HEALTH_TOKEN) {
+          return json(401, { error: "invalid health token" }, origin);
+        }
+        await probeProviders(env.DB);
+        const snapshot = await healthSnapshot(env.DB);
+        return json(snapshot.ok && !snapshot.stale ? 200 : 503, snapshot, origin);
+      }
       if (sub === "/api/status") {
         const mail = await env.DB.prepare("SELECT COUNT(*) AS count FROM mail_inboxes WHERE client_id = ? AND expires_at > ?")
           .bind(client, now())

@@ -25,6 +25,24 @@ host, so the web build does not offer them (the desktop app still supports
 Mail.tm). OTP extraction and the TOTP authenticator remain entirely in the
 browser and never call the API.
 
+### Upstream health
+
+The hosted API records the last success/failure of every upstream provider
+(Guerrilla Mail, Best-TempMail, TempMail.ai and receive-sms.io) in D1. Health
+writes happen on state changes, a slow heartbeat and explicit probes, so normal
+polling traffic does not spend the write budget.
+
+- `GET /api/health` — JSON snapshot for people and the app (always `200`).
+- `GET /api/health/check` — probes every provider with a cheap reachability
+  request, records the result, and answers `200` only when all four are
+  healthy. Point an external pinger at this URL: a `503` means a provider is
+  failing or the checks themselves have gone stale. Probes run at most once a
+  minute, so a pinger cannot drain provider quota. Set a `HEALTH_TOKEN` secret
+  and pass `?token=...` to keep the probe endpoint private.
+
+The Mail tab shows each provider's current state and when it was last checked;
+the SMS tab shows the source status and its last success time.
+
 The hosted build has no account system. A random browser client ID scopes the
 Mail/SMS metadata stored in D1, and **Settings → Clear all data** removes it.
 Do not treat public temporary inboxes as private. Mailbox contents and upstream
