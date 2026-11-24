@@ -45,11 +45,14 @@ async function main() {
   const pages = await request(PAGES);
   assert.equal(pages.response.status, 200, `Pages returned ${pages.response.status}`);
   assert.match(pages.body, /GMO TempTools/i, "Pages response is not the app");
+  assert.ok(pages.body.includes("./config.js"), "the Pages page does not load config.js");
+  const config = await request(`${PAGES}/config.js`);
+  assert.equal(config.response.status, 200, `config.js returned ${config.response.status}`);
   assert.ok(
-    pages.body.includes(new URL(API).host),
-    `the Pages bundle does not point at ${API}`,
+    config.body.includes(new URL(API).origin),
+    `config.js does not point at ${API}`,
   );
-  console.log(`ok pages   ${PAGES}`);
+  console.log(`ok pages   ${PAGES} -> ${API}`);
 
   const health = await request(`${API}/api/health`, { headers: headers() });
   assert.equal(health.response.status, 200, health.body);
