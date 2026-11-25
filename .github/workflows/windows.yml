@@ -58,6 +58,12 @@ jobs:
         shell: bash
         run: bash ./scripts/build.sh
 
+      - name: Build the GitHub Pages bundle
+        shell: bash
+        env:
+          TEMPTOOLS_API_BASE: https://gmo-temptools-web-api-z1jsh3.freebuff.site
+        run: bash ./scripts/build-pages.sh
+
       - name: Start the app in headless test mode
         shell: bash
         run: |
@@ -72,6 +78,10 @@ jobs:
         shell: bash
         run: npx playwright test
 
+      - name: Run PWA installability and offline tests
+        shell: bash
+        run: npm run test:pwa
+
       - name: Stop the test app
         if: always()
         shell: bash
@@ -84,5 +94,7 @@ jobs:
           name: playwright-report
           path: |
             playwright-report/
+            playwright-report-pwa/
             test-results/
+            test-results-pwa/
           if-no-files-found: ignore

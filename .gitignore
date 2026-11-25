@@ -4,7 +4,9 @@ target/
 .run/
 dist/
 playwright-report/
+playwright-report-pwa/
 test-results/
+test-results-pwa/
 .freebuff/
 .wrangler/
 .env

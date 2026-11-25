@@ -62,10 +62,13 @@ export locally, showing “backup needed” until one has been made.
 ### Install and offline
 
 The Pages build ships a web app manifest and a service worker, so it can be
-installed from the browser. Only the same-origin shell (HTML, CSS, JS, icons) is
-cached: the OTP extractor and the local vault keep working offline, while Mail
-and SMS show an offline banner because their API is remote. Inboxes, numbers and
-provider responses are never written to the cache.
+installed from the browser. When the browser offers a deferred install prompt,
+the hosted header shows an **Install app** button. It stays hidden when the app
+is already installed or the browser cannot install it, and reports accepted,
+dismissed and failed prompts in the page. Only the same-origin shell (HTML, CSS,
+JS, icons) is cached: the OTP extractor and the local vault keep working
+offline, while Mail and SMS show an offline banner because their API is remote.
+Inboxes, numbers and provider responses are never written to the cache.
 
 ### Content policy
 
@@ -279,6 +282,24 @@ integration tests for the shared libraries and the unified app. The Playwright
 suite covers Mail, SMS, OTP and Settings through the real local web app.
 The app must be running (`./scripts/run-all.sh`) for Playwright; the Rust
 integration tests start their own transient listeners.
+
+The hosted Pages bundle has its own PWA regression check. It owns a static
+server for `docs/` on `127.0.0.1:4173`, stops that server before reloading, and
+fails if the manifest produces installability errors, the service worker stops
+controlling the page or caching a shell asset, or the app shell cannot reload
+and run the local OTP engine with the server actually offline. It refuses to
+run if something is already serving that port; the browser's offline flag is
+only used so `navigator.onLine` and the offline banner report offline.
+
+```bash
+TEMPTOOLS_API_BASE=https://gmo-temptools-web-api-z1jsh3.freebuff.site \
+  ./scripts/build-pages.sh
+npm run test:pwa                              # Playwright Chromium
+PLAYWRIGHT_CHANNEL=msedge npm run test:pwa    # installed Edge
+```
+
+It does not need the desktop app running. CI builds `docs/` and runs this suite
+after the desktop Playwright tests.
 
 ### Hosted API tests
 

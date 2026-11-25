@@ -11,6 +11,7 @@
     "smoke:hosted": "node scripts/smoke-hosted.mjs",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
+    "test:pwa": "playwright test --config playwright.pwa.config.ts",
     "install:e2e": "playwright install chromium"
   },
   "devDependencies": {
