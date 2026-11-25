@@ -85,52 +85,37 @@
         timers.push(window.setInterval(callback, milliseconds));
     }
     // The browser only fires beforeinstallprompt when the app is installable
-    // and not already installed. Keeping the event lets this page offer its own
-    // button instead of making people find the browser menu.
+    // and not already installed. Keep that event and show the button only while
+    // it can actually open a prompt.
     function setupInstall() {
         const button = GmoUI.$("#install-app");
         if (!button)
             return;
-        const standalone = window.matchMedia("(display-mode: standalone)");
-        const iosStandalone = Boolean(navigator.standalone);
         let deferred = null;
-        let installed = standalone.matches || iosStandalone;
-        let busy = false;
-        let announced = false;
-        const announceInstalled = () => {
-            if (announced)
+        let installed = window.matchMedia("(display-mode: standalone)").matches ||
+            Boolean(navigator.standalone);
+        const paint = () => {
+            button.hidden = installed || !deferred;
+        };
+        const markInstalled = () => {
+            if (installed)
                 return;
-            announced = true;
+            installed = true;
+            deferred = null;
+            paint();
             toast("GMO TempTools installed. Open it from your Start menu or home screen.", 5000);
         };
-        const paint = () => {
-            const available = !installed && !standalone.matches && (busy || Boolean(deferred));
-            button.hidden = !available;
-            if (!available || busy)
-                return;
-            button.disabled = false;
-            button.textContent = "Install app";
-            button.removeAttribute("aria-busy");
-        };
         button.addEventListener("click", async () => {
-            if (busy)
-                return;
-            if (!deferred) {
-                toast("Installation is not available right now. Use the browser menu to install GMO TempTools.", 4000);
-                return;
-            }
             const prompt = deferred;
+            if (!prompt)
+                return;
             deferred = null;
-            busy = true;
-            button.disabled = true;
-            button.textContent = "Installing…";
-            button.setAttribute("aria-busy", "true");
+            paint();
             try {
                 await prompt.prompt();
                 const choice = await prompt.userChoice;
                 if (choice.outcome === "accepted") {
-                    installed = true;
-                    announceInstalled();
+                    markInstalled();
                 }
                 else {
                     toast("Installation dismissed. You can install later from the browser menu.", 4000);
@@ -139,31 +124,13 @@
             catch {
                 toast("Could not open the install prompt. Use the browser menu to install GMO TempTools.", 4500);
             }
-            finally {
-                busy = false;
-                button.disabled = false;
-                button.removeAttribute("aria-busy");
-                paint();
-            }
         });
         window.addEventListener("beforeinstallprompt", (event) => {
             event.preventDefault();
             deferred = event;
             paint();
         });
-        window.addEventListener("appinstalled", () => {
-            installed = true;
-            deferred = null;
-            paint();
-            announceInstalled();
-        });
-        standalone.addEventListener("change", () => {
-            if (standalone.matches) {
-                installed = true;
-                deferred = null;
-            }
-            paint();
-        });
+        window.addEventListener("appinstalled", markInstalled);
         paint();
     }
     function paintConnectivity() {

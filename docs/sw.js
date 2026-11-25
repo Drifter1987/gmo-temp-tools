@@ -4,7 +4,7 @@
 // cross-origin and goes straight to the network, so no inbox, number or OTP data
 // is ever written to the cache.
 
-const CACHE = "gmo-temptools-shell-1795565423";
+const CACHE = "gmo-temptools-shell-1795566250";
 const INDEX = new URL("./index.html", self.registration.scope).href;
 const SHELL = [
   "./",
